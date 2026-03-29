@@ -27,20 +27,21 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// Config 는 인증 서비스에 필요한 전체 설정을 담습니다.
 type Config struct {
-	JWTSecret               string
-	JWTIssuer               string
-	JWTExpiryMinutes        int
-	RefreshTokenExpiryDays  int
-	TOTPIssuer              string
-	TOTPChallengeExpiryMins int
-	BcryptCost              int
-	BootstrapAdminEmail     string
-	BootstrapAdminPassword  string
-	BootstrapAdminRole      string
-	LoginIPRateLimitPerMin  int
-	LoginFailThreshold      int
-	LoginLockMinutes        int
+	JWTSecret               string // JWT 서명에 사용하는 HS256 비밀키 (노출 금지)
+	JWTIssuer               string // JWT iss 클레임 값 (예: "ucware-mail")
+	JWTExpiryMinutes        int    // 액세스 토큰 유효 시간(분), 기본 15분 권장
+	RefreshTokenExpiryDays  int    // 리프레시 토큰 유효 기간(일)
+	TOTPIssuer              string // OTP 앱에 표시될 발급자 이름
+	TOTPChallengeExpiryMins int    // TOTP 챌린지 토큰이 만료되기까지의 시간(분)
+	BcryptCost              int    // bcrypt 해시 비용 (보안↑ = 느림, 최소 12 권장)
+	BootstrapAdminEmail     string // 최초 실행 시 자동 생성할 관리자 이메일
+	BootstrapAdminPassword  string // 최초 실행 시 자동 생성할 관리자 초기 비밀번호
+	BootstrapAdminRole      string // 최초 관리자에게 부여할 역할 (기본: superadmin)
+	LoginIPRateLimitPerMin  int    // IP 당 분당 허용 로그인 시도 횟수 (레이트리밋)
+	LoginFailThreshold      int    // 연속 실패 N회 이후 계정 잠금 발동
+	LoginLockMinutes        int    // 계정 잠금 지속 시간(분)
 }
 
 type Dependencies struct {
@@ -54,20 +55,21 @@ type Dependencies struct {
 	IsValidRole        func(role string) bool
 }
 
+// Service 는 관리자 인증 전반(로그인, TOTP, OAuth2, JWT 발급/검증, RBAC)을 담당합니다.
 type Service struct {
-	store              *store.SQLiteStore
+	store              *store.SQLiteStore // 관리자 계정·토큰·TOTP 상태를 저장하는 SQLite 저장소
 	cfg                Config
-	googleOAuth2Cfg    *oauth2.Config
-	microsoftOAuth2Cfg *oauth2.Config
-	writeAuditFn       func(ctx context.Context, action, actor, email, status, message string, r *http.Request)
-	actorFromContextFn func(ctx context.Context) string
-	setAuthContextFn   func(ctx context.Context, email, role string) context.Context
-	isValidRoleFn      func(role string) bool
-	mu                 sync.RWMutex
-	loginMu            sync.Mutex
-	loginLimiter       *ratelimit.FixedWindow
-	loginFailures      map[string]int
-	loginLockedUntil   map[string]time.Time
+	googleOAuth2Cfg    *oauth2.Config                                                                           // Google OAuth2 설정 (런타임 갱신 가능)
+	microsoftOAuth2Cfg *oauth2.Config                                                                           // Microsoft OAuth2 설정 (런타임 갱신 가능)
+	writeAuditFn       func(ctx context.Context, action, actor, email, status, message string, r *http.Request) // 감사 로그 기록 콜백
+	actorFromContextFn func(ctx context.Context) string                                                         // 현재 요청의 행위자(이메일)를 컨텍스트에서 추출
+	setAuthContextFn   func(ctx context.Context, email, role string) context.Context                            // 인증 정보를 컨텍스트에 삽입
+	isValidRoleFn      func(role string) bool                                                                   // 역할값 유효성 검사 (superadmin/admin/viewer 등)
+	mu                 sync.RWMutex                                                                             // OAuth2 설정 런타임 갱신 시 경쟁 방지용 RW 뮤텍스
+	loginMu            sync.Mutex                                                                               // 로그인 실패 횟수·잠금 맵에 대한 단독 접근 보장
+	loginLimiter       *ratelimit.FixedWindow                                                                   // IP 기준 분당 로그인 시도 횟수 제한기
+	loginFailures      map[string]int                                                                           // 이메일 → 아직 누적된 연속 실패 횟수
+	loginLockedUntil   map[string]time.Time                                                                     // 이메일 → 잠금 해제 시각 (잠금 중인 계정)
 }
 
 type accessClaims struct {
@@ -75,15 +77,20 @@ type accessClaims struct {
 	jwt.RegisteredClaims
 }
 
+// NewService 는 인증 서비스를 초기화합니다.
+// 설정값이 0 이하인 경우 안전한 기본값(레이트리밋 30rpm, 실패 5회, 잠금 15분)으로 보정합니다.
 func NewService(dep Dependencies) *Service {
 	cfg := dep.Config
 	if cfg.LoginIPRateLimitPerMin < 1 {
+		// 환경변수 미설정 시 분당 30회 허용
 		cfg.LoginIPRateLimitPerMin = 30
 	}
 	if cfg.LoginFailThreshold < 1 {
+		// 연속 실패 5회부터 잠금
 		cfg.LoginFailThreshold = 5
 	}
 	if cfg.LoginLockMinutes < 1 {
+		// 기본 잠금 지속 시간 15분
 		cfg.LoginLockMinutes = 15
 	}
 
@@ -109,6 +116,8 @@ func (s *Service) SetOAuth2Configs(google, microsoft *oauth2.Config) {
 	s.microsoftOAuth2Cfg = microsoft
 }
 
+// HandleLogin 은 이메일/비밀번호 로그인 요청을 처리합니다.
+// 처리 순서: IP 레이트리밋 → 계정 잠금 확인 → 비밀번호 검증 → TOTP 여부 분기 → JWT 발급
 func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -116,6 +125,7 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC()
 	clientIP := requestClientIP(r)
+	// IP 기준 분당 허용 횟수 초과 시 즉시 429 반환 (브루트포스 방어)
 	if !s.loginLimiter.Allow(clientIP, now) {
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		s.writeAudit(r.Context(), "login", "", "", "failed", "rate limited", r)
@@ -128,6 +138,7 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	// 연속 실패로 잠긴 계정인지 확인 (HTTP 423 Locked 반환)
 	if s.isLoginLocked(req.Email, now) {
 		http.Error(w, "account temporarily locked", http.StatusLocked)
 		s.writeAudit(r.Context(), "login", req.Email, req.Email, "failed", "account locked", r)
@@ -136,6 +147,7 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	adminUser, err := s.store.GetAdminUserByEmail(r.Context(), req.Email)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			// 존재하지 않는 이메일도 실패 횟수에 포함 (계정 존재 여부 노출 방지)
 			s.registerLoginFailure(req.Email, now)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			s.writeAudit(r.Context(), "login", "", req.Email, "failed", "unknown account", r)
@@ -144,13 +156,17 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// bcrypt 타이밍 안전 비교 — 일치하지 않으면 실패 횟수 누적
 	if err := bcrypt.CompareHashAndPassword([]byte(adminUser.PasswordHash), []byte(req.Password)); err != nil {
 		s.registerLoginFailure(req.Email, now)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		s.writeAudit(r.Context(), "login", req.Email, req.Email, "failed", "wrong password", r)
 		return
 	}
+	// 로그인 성공 시 실패 카운터 초기화
 	s.clearLoginFailures(req.Email)
+	// TOTP 활성화된 계정은 2단계 인증 챌린지 토큰을 발급하고 즉시 반환
+	// 클라이언트는 challengeToken + OTP 코드로 /v1/auth/totp/challenge 를 추가 호출해야 함
 	if adminUser.TOTPEnabled {
 		challengeID, err := GenerateRefreshToken()
 		if err != nil {
@@ -184,6 +200,8 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, authtypes.LoginResponse{AccessToken: signed, RefreshToken: rawRT, TokenType: "Bearer", ExpiresAt: expiresAt, Role: adminUser.Role, Email: adminUser.Email})
 }
 
+// isLoginLocked 는 해당 이메일 계정이 현재 잠금 상태인지 확인합니다.
+// 잠금 만료 시각이 지난 경우 맵에서 자동 제거(지연 소멸)합니다.
 func (s *Service) isLoginLocked(email string, now time.Time) bool {
 	email = strings.ToLower(strings.TrimSpace(email))
 	if !isValidEmail(email) {
@@ -196,13 +214,16 @@ func (s *Service) isLoginLocked(email string, now time.Time) bool {
 		return false
 	}
 	if now.Before(lockedUntil) {
-		return true
+		return true // 아직 잠금 기간 중
 	}
+	// 잠금 만료 — 맵에서 제거하여 메모리 누수 방지
 	delete(s.loginLockedUntil, email)
 	delete(s.loginFailures, email)
 	return false
 }
 
+// registerLoginFailure 는 로그인 실패 횟수를 1 증가시키고,
+// 임계값(LoginFailThreshold) 도달 시 LoginLockMinutes 분 동안 계정을 잠급니다.
 func (s *Service) registerLoginFailure(email string, now time.Time) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	if !isValidEmail(email) {
@@ -210,16 +231,19 @@ func (s *Service) registerLoginFailure(email string, now time.Time) {
 	}
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
+	// 이미 잠금 중이면 카운터 증가 불필요 (잠금 연장도 하지 않음)
 	if until, ok := s.loginLockedUntil[email]; ok && now.Before(until) {
 		return
 	}
 	s.loginFailures[email]++
 	if s.loginFailures[email] >= s.cfg.LoginFailThreshold {
+		// 임계값 초과 → 잠금 기간 설정 후 카운터 초기화
 		s.loginLockedUntil[email] = now.Add(time.Duration(s.cfg.LoginLockMinutes) * time.Minute)
 		s.loginFailures[email] = 0
 	}
 }
 
+// clearLoginFailures 는 로그인 성공 시 해당 이메일의 실패 기록과 잠금 상태를 모두 삭제합니다.
 func (s *Service) clearLoginFailures(email string) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	if email == "" {
@@ -231,9 +255,13 @@ func (s *Service) clearLoginFailures(email string) {
 	delete(s.loginLockedUntil, email)
 }
 
+// requestClientIP 는 프록시 체인을 고려하여 실제 클라이언트 IP를 추출합니다.
+// 우선순위: X-Forwarded-For 첫 번째 IP → X-Real-IP → RemoteAddr
 func requestClientIP(r *http.Request) string {
+	// 리버스 프록시(nginx, ALB 등)가 추가하는 헤더에서 원본 IP 추출
 	xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
 	if xff != "" {
+		// 다중 프록시 체인의 경우 가장 왼쪽(첫 번째)이 클라이언트 IP
 		first := strings.TrimSpace(strings.Split(xff, ",")[0])
 		if first != "" {
 			return first
@@ -243,6 +271,7 @@ func requestClientIP(r *http.Request) string {
 	if xri != "" {
 		return xri
 	}
+	// 프록시 없이 직접 연결된 경우 RemoteAddr 파싱 (host:port 형식)
 	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err == nil && host != "" {
 		return host
@@ -250,6 +279,8 @@ func requestClientIP(r *http.Request) string {
 	return strings.TrimSpace(r.RemoteAddr)
 }
 
+// HandleRefreshToken 은 유효한 리프레시 토큰을 받아 새 액세스 토큰을 발급합니다.
+// 리프레시 토큰은 DB에 해시로 저장되며, 만료·철회 여부를 검사합니다.
 func (s *Service) HandleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -299,6 +330,8 @@ func (s *Service) HandleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, authtypes.LoginResponse{AccessToken: signed, TokenType: "Bearer", ExpiresAt: expiresAt, Role: adminUser.Role, Email: adminUser.Email})
 }
 
+// HandleLogout 은 리프레시 토큰을 DB에서 철회하여 세션을 무효화합니다.
+// 토큰 없이 호출해도 정상 응답(멱등성 보장)합니다.
 func (s *Service) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -356,6 +389,8 @@ func (s *Service) HandleAdminByEmail(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// HandleTOTPSetup 은 로그인한 관리자에게 TOTP 시크릿을 생성하고 QR 코드 URL을 반환합니다.
+// 이후 HandleTOTPConfirm 으로 OTP를 한 번 검증해야 TOTP가 활성화됩니다.
 func (s *Service) HandleTOTPSetup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -375,6 +410,7 @@ func (s *Service) HandleTOTPSetup(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, authtypes.TOTPSetupResponse{Secret: key.Secret(), OTPAuth: key.URL()})
 }
 
+// HandleTOTPConfirm 은 관리자가 OTP 앱에 등록 후 첫 코드를 검증하여 TOTP를 활성화합니다.
 func (s *Service) HandleTOTPConfirm(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -410,6 +446,7 @@ func (s *Service) HandleTOTPConfirm(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"result": "totp enabled"})
 }
 
+// HandleTOTPDisable 은 현재 비밀번호 재확인 후 TOTP를 비활성화합니다.
 func (s *Service) HandleTOTPDisable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -444,6 +481,8 @@ func (s *Service) HandleTOTPDisable(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"result": "totp disabled"})
 }
 
+// HandleTOTPChallenge 는 비밀번호 검증 후 발급된 챌린지 토큰과 OTP 코드를 검증하고
+// 최종 JWT 액세스 토큰과 리프레시 토큰을 발급합니다 (2단계 인증 완료).
 func (s *Service) HandleTOTPChallenge(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -500,11 +539,14 @@ func (s *Service) HandleTOTPChallenge(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// 로그인 성공 시 만료된 챌린지 레코드를 정리 (에러는 무시)
 	_ = s.store.PurgeExpiredTOTPChallenges(r.Context())
 	s.writeAudit(r.Context(), "totp_challenge", adminUser.Email, adminUser.Email, "ok", "login success", r)
 	httpx.WriteJSON(w, http.StatusOK, authtypes.LoginResponse{AccessToken: accessToken, RefreshToken: rawRT, TokenType: "Bearer", ExpiresAt: expiresAt, Role: adminUser.Role, Email: adminUser.Email})
 }
 
+// HandleOAuth2Start 는 OAuth2 인증 흐름을 시작합니다.
+// CSRF 방어를 위해 랜덤 state 토큰을 생성·DB 저장 후 provider 인증 페이지로 리다이렉트합니다.
 func (s *Service) HandleOAuth2Start(provider string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -531,6 +573,8 @@ func (s *Service) HandleOAuth2Start(provider string) http.HandlerFunc {
 	}
 }
 
+// HandleOAuth2Callback 은 provider가 리다이렉트한 요청을 처리합니다.
+// state 검증 → 인증 코드 교환 → userinfo 조회 → 관리자 upsert → JWT 발급 순으로 진행합니다.
 func (s *Service) HandleOAuth2Callback(provider string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -606,13 +650,17 @@ func (s *Service) HandleOAuth2Callback(provider string) http.HandlerFunc {
 	}
 }
 
+// WithAuth 는 JWT 검증 및 RBAC 역할 확인을 수행하는 HTTP 미들웨어를 반환합니다.
+// allowedRoles에 포함된 역할만 통과하며, 검증 실패 시 감사 로그를 기록합니다.
 func (s *Service) WithAuth(next http.Handler, allowedRoles ...string) http.Handler {
+	// 역할 목록을 O(1) 조회용 맵으로 변환
 	allow := make(map[string]struct{}, len(allowedRoles))
 	for _, role := range allowedRoles {
 		allow[role] = struct{}{}
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+		// Authorization: Bearer <token> 형식 필수
 		if authHeader == "" || !strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			s.writeAudit(r.Context(), "auth", "", "", "failed", "missing bearer token", r)
@@ -626,6 +674,7 @@ func (s *Service) WithAuth(next http.Handler, allowedRoles ...string) http.Handl
 			return
 		}
 		claims := &accessClaims{}
+		// HS256 서명 방식만 허용 (알고리즘 혼용 공격 방어)
 		token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (any, error) {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 				return nil, fmt.Errorf("unexpected signing method")
@@ -637,11 +686,13 @@ func (s *Service) WithAuth(next http.Handler, allowedRoles ...string) http.Handl
 			s.writeAudit(r.Context(), "auth", "", "", "failed", "invalid token", r)
 			return
 		}
+		// iss·sub 클레임 및 역할 유효성을 추가 검증
 		if claims.Issuer != s.cfg.JWTIssuer || claims.Subject == "" || !s.isValidRole(claims.Role) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			s.writeAudit(r.Context(), "auth", "", "", "failed", "invalid claims", r)
 			return
 		}
+		// RBAC: 허용 역할 목록에 없으면 403 Forbidden
 		if _, ok := allow[claims.Role]; !ok {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			s.writeAudit(r.Context(), "auth", claims.Subject, "", "failed", "rbac denied", r)
@@ -655,6 +706,8 @@ func (s *Service) WithAuth(next http.Handler, allowedRoles ...string) http.Handl
 	})
 }
 
+// EnsureBootstrapAdmin 은 애플리케이션 최초 구동 시 초기 관리자 계정을 생성합니다.
+// 이미 계정이 존재하면 Upsert로 비밀번호만 갱신합니다.
 func (s *Service) EnsureBootstrapAdmin(ctx context.Context) error {
 	email := strings.TrimSpace(strings.ToLower(s.cfg.BootstrapAdminEmail))
 	if !isValidEmail(email) {
@@ -671,6 +724,8 @@ func (s *Service) EnsureBootstrapAdmin(ctx context.Context) error {
 	return err
 }
 
+// GenerateRefreshToken 은 암호학적으로 안전한 32바이트 난수를 hex 인코딩하여 반환합니다.
+// DB에는 이 값의 SHA-256 해시만 저장하여 토큰 탈취 시 재사용을 방지합니다.
 func GenerateRefreshToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := crand.Read(b); err != nil {
@@ -679,6 +734,8 @@ func GenerateRefreshToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// HashRefreshToken 은 원본 리프레시 토큰의 SHA-256 해시를 반환합니다.
+// DB 저장용으로, 원본 토큰은 클라이언트에만 존재합니다.
 func HashRefreshToken(raw string) string {
 	h := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(h[:])
@@ -694,6 +751,8 @@ func (s *Service) IssueRefreshToken(now time.Time) (raw, hash string, expiry tim
 	return
 }
 
+// issueAccessToken 은 관리자 정보를 담은 HS256 서명 JWT 액세스 토큰을 생성합니다.
+// 토큰에는 Role, Issuer, Subject(이메일), 발급시각, 만료시각이 포함됩니다.
 func (s *Service) issueAccessToken(adminUser store.AdminUser, now time.Time) (signed string, expiresAt time.Time, err error) {
 	expiresAt = now.Add(time.Duration(s.cfg.JWTExpiryMinutes) * time.Minute)
 	claims := accessClaims{Role: adminUser.Role, RegisteredClaims: jwt.RegisteredClaims{Issuer: s.cfg.JWTIssuer, Subject: adminUser.Email, IssuedAt: jwt.NewNumericDate(now), ExpiresAt: jwt.NewNumericDate(expiresAt)}}
@@ -898,6 +957,8 @@ func (s *Service) writeAudit(ctx context.Context, action, actor, email, status, 
 	}
 }
 
+// isValidEmail 은 RFC 5322 파서를 사용하여 이메일 주소 유효성을 검사합니다.
+// "Display <addr>" 형식의 입력은 거부하고 순수 이메일 주소만 허용합니다.
 func isValidEmail(value string) bool {
 	addr, err := mail.ParseAddress(value)
 	if err != nil {

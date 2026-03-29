@@ -32,37 +32,42 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// Config 는 메일 사용자 관리·아카이브·발송에 필요한 서비스 설정을 담습니다.
 type Config struct {
-	DovecotUsersFile        string
-	PostfixMailboxMapsFile  string
-	PostfixDomainsFile      string
-	MailRoot                string
-	MailUID                 int
-	MailGID                 int
-	BcryptCost              int
-	ArchiveAutoRouteEnabled bool
-	ArchiveInboundMailbox   string
-	ArchiveOutboundMailbox  string
-	SMTPRelayAddr           string
-	SMTPUsername            string
-	SMTPPassword            string
-	SendRateLimitPerMin     int
+	DovecotUsersFile        string // Dovecot 사용자 파일 경로 (users.passwd)
+	PostfixMailboxMapsFile  string // Postfix virtual_mailbox_maps 파일 경로
+	PostfixDomainsFile      string // Postfix virtual_mailbox_domains 파일 경로
+	MailRoot                string // vmail 홈 디렉터리 루트 (예: /var/mail/vhosts)
+	MailUID                 int    // 생성된 vmail 디렉터리 소유자 UID
+	MailGID                 int    // 생성된 vmail 디렉터리 소유자 GID
+	BcryptCost              int    // 사용자 비밀번호 bcrypt 해시 비용
+	ArchiveAutoRouteEnabled bool   // 발신자/수신자 이메일로 메일박스를 자동 결정
+	ArchiveInboundMailbox   string // 수신 메시지를 저장할 메일박스 이름 (기본: INBOX)
+	ArchiveOutboundMailbox  string // 발송 메시지를 저장할 메일박스 이름 (기본: SENT)
+	SMTPRelayAddr           string // SMTP 릴레이 주소 (예: postfix:587)
+	SMTPUsername            string // SMTP 인증 사용자명 (없으면 익명 릴레이)
+	SMTPPassword            string // SMTP 인증 비밀번호
+	SendRateLimitPerMin     int    // actor(또는 IP) 당 분당 발송 허용 횟수
 }
 
+// SendMessageRequest 는 메일 발송 API 요청 본문입니다.
+// multipart/form-data 또는 application/json 모두 지원합니다.
 type SendMessageRequest struct {
 	FromAddr    string           `json:"fromAddr"`
 	ToAddr      string           `json:"toAddr"`
 	Subject     string           `json:"subject"`
 	TextBody    string           `json:"textBody"`
-	RawMIME     string           `json:"rawMime"`
-	MailboxID   string           `json:"mailboxId"`
+	RawMIME     string           `json:"rawMime"`   // 완전히 조립된 RFC 5322 메시지 (없으면 서버가 생성)
+	MailboxID   string           `json:"mailboxId"` // 아카이브할 메일박스 ID (없으면 AutoRoute 또는 SENT 폴백)
 	Attachments []SendAttachment `json:"attachments,omitempty"`
 }
 
+// SendAttachment 는 JSON 방식으로 전달되는 첨부 파일을 나타냅니다.
+// 파일 내용은 Base64로 인코딩되어야 합니다.
 type SendAttachment struct {
 	Filename      string `json:"filename"`
 	ContentType   string `json:"contentType"`
-	ContentBase64 string `json:"contentBase64"`
+	ContentBase64 string `json:"contentBase64"` // Base64 인코딩된 파일 바이트
 }
 
 type SendMessageResponse struct {
@@ -74,13 +79,13 @@ type SendMessageResponse struct {
 }
 
 const (
-	sendMaxAttachments          = 100
-	sendMaxAttachmentBytes      = int64(1024 * 1024 * 1024)     // 1 GB per file
-	sendMaxTotalAttachBytes     = int64(5 * 1024 * 1024 * 1024) // 5 GB total
-	sendMultipartMemLimit       = 8 * 1024 * 1024
-	sendJSONMaxAttachmentBytes  = int64(10 * 1024 * 1024)
-	sendJSONMaxTotalAttachBytes = int64(50 * 1024 * 1024)
-	sendArchiveRawMaxBytes      = int64(25 * 1024 * 1024)
+	sendMaxAttachments          = 100                           // 단일 메일에 허용되는 최대 첨부 파일 수
+	sendMaxAttachmentBytes      = int64(1024 * 1024 * 1024)     // 파일 하나당 최대 크기: 1 GB
+	sendMaxTotalAttachBytes     = int64(5 * 1024 * 1024 * 1024) // 전체 첨부 합계 최대 크기: 5 GB
+	sendMultipartMemLimit       = 8 * 1024 * 1024               // multipart 폼 인메모리 파싱 한도: 8 MB
+	sendJSONMaxAttachmentBytes  = int64(10 * 1024 * 1024)       // JSON 방식 단일 첨부 최대: 10 MB
+	sendJSONMaxTotalAttachBytes = int64(50 * 1024 * 1024)       // JSON 방식 전체 첨부 합계 최대: 50 MB
+	sendArchiveRawMaxBytes      = int64(25 * 1024 * 1024)       // 아카이브에 저장할 원본 메시지 최대 크기: 25 MB
 )
 
 type sendFilePayload struct {
@@ -102,17 +107,20 @@ type Dependencies struct {
 	RoleFromContext  func(ctx context.Context) string
 }
 
+// Service 는 메일 사용자 CRUD·아카이브·발송·감사 로그 핸들러를 제공합니다.
 type Service struct {
-	store          *store.SQLiteStore
-	archive        *archive.SQLStore
+	store          *store.SQLiteStore // 메일 사용자 및 감사 로그 저장소
+	archive        *archive.SQLStore  // 메일 아카이브 DB (nil이면 비활성)
 	cfg            Config
 	writeAuditFn   func(ctx context.Context, action, actor, email, status, message string, r *http.Request)
-	actorFromCtxFn func(ctx context.Context) string
-	roleFromCtxFn  func(ctx context.Context) string
-	mu             sync.Mutex
-	sendLimiter    *ratelimit.FixedWindow
+	actorFromCtxFn func(ctx context.Context) string // JWT 클레임에서 이메일 추출
+	roleFromCtxFn  func(ctx context.Context) string // JWT 클레임에서 역할 추출
+	mu             sync.Mutex                       // syncNow 동시 실행 방지
+	sendLimiter    *ratelimit.FixedWindow           // 발송 API 레이트리밋 (actor/IP 기준)
 }
 
+// NewService 는 핸들러 서비스를 초기화합니다.
+// SendRateLimitPerMin < 1 이면 기본값 60으로 보정합니다.
 func NewService(dep Dependencies) *Service {
 	cfg := dep.Config
 	if cfg.SendRateLimitPerMin < 1 {
@@ -129,6 +137,7 @@ func NewService(dep Dependencies) *Service {
 	}
 }
 
+// HandleHealthz 는 서비스 생존 여부를 확인하는 헬스체크 엔드포인트입니다.
 func (s *Service) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -137,6 +146,8 @@ func (s *Service) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// HandleUsers 는 메일 사용자 목록 조회(GET) 및 사용자 생성(POST)을 처리합니다.
+// POST 는 admin 역할만 허용합니다.
 func (s *Service) HandleUsers(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -152,6 +163,8 @@ func (s *Service) HandleUsers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// HandleUserByEmail 는 이메일로 특정 사용자를 삭제합니다.
+// 삭제 후 Dovecot·Postfix 설정 파일을 즉시 재동기화합니다.
 func (s *Service) HandleUserByEmail(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -184,6 +197,7 @@ func (s *Service) HandleUserByEmail(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"result": "deleted"})
 }
 
+// HandleSync 는 SQLite 사용자 DB에서 Dovecot/Postfix 설정 파일을 수동으로 재생성합니다.
 func (s *Service) HandleSync(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -198,6 +212,8 @@ func (s *Service) HandleSync(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"result": "synced"})
 }
 
+// HandleAudits 는 최근 감사 로그를 최대 1000건 조회합니다.
+// ?limit=N (기본 100, 최대 1000) 쿼리 파라미터로 개수를 지정합니다.
 func (s *Service) HandleAudits(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -404,6 +420,9 @@ func (s *Service) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// HandleSend 는 SMTP 릴레이를 통해 메일을 발송하고 아카이브 DB에 복사본을 저장합니다.
+// 요청 형식: multipart/form-data(대용량 첨부) 또는 application/json
+// actor 기준 분당 발송 횟수 제한이 적용됩니다.
 func (s *Service) HandleSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -411,10 +430,11 @@ func (s *Service) HandleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	actor := strings.TrimSpace(s.actorFromContext(r.Context()))
 	if actor == "" {
-		actor = "ip:" + requestClientIP(r)
+		actor = "ip:" + requestClientIP(r) // 인증 없는 요청은 IP를 기준으로 제한
 	} else {
 		actor = "actor:" + strings.ToLower(actor)
 	}
+	// 분당 발송 횟수 초과 시 429 반환
 	if !s.sendLimiter.Allow(actor, time.Now().UTC()) {
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		s.writeAudit(r.Context(), "send_message", s.actorFromContext(r.Context()), "", "failed", "rate limited", r)
@@ -518,6 +538,8 @@ func (s *Service) HandleSend(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
+// archiveOutboundCopy 는 발송 완료된 메시지를 아카이브 DB에 outbound 방향으로 저장합니다.
+// mailboxID 가 없으면 AutoRoute 또는 ArchiveOutboundMailbox(기본 SENT)를 사용합니다.
 func (s *Service) archiveOutboundCopy(ctx context.Context, req SendMessageRequest, raw string) error {
 	if s.archive == nil {
 		return fmt.Errorf("archive db is disabled")
@@ -630,6 +652,8 @@ func (s *Service) createUser(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusCreated, userstypes.UserResponse{Email: u.Email, CreatedAt: u.CreatedAt})
 }
 
+// syncNow 는 SQLite 사용자 목록을 기반으로 Dovecot/Postfix 설정 파일을 재생성합니다.
+// 뮤텍스로 동시 호출 시 파일 충돌을 방지합니다.
 func (s *Service) syncNow(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

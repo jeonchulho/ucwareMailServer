@@ -18,13 +18,12 @@ import (
 )
 
 const (
-	lmtpMaxRcpts    = 100
-	lmtpIdleTimeout = 5 * time.Minute
+	lmtpMaxRcpts    = 100             // 한 트랜잭션에서 허용하는 최대 수신자 수 (RFC 5321 권고)
+	lmtpIdleTimeout = 5 * time.Minute // 명령어 입력 대기 및 DATA 수신 최대 유휴 시간
 )
 
-// runLMTPServer starts an LMTP listener that accepts mail deliveries from an MTA
-// (e.g. Postfix) and writes each message into the archive DB.
-// It blocks until ctx is cancelled.
+// runLMTPServer 는 MTA(예: Postfix)로부터 메일을 수신해 아카이브 DB에 저장하는
+// LMTP 리스너를 시작합니다. ctx가 취소될 때까지 블로킹됩니다.
 func runLMTPServer(ctx context.Context, cfg config, archiveStore *archive.SQLStore) error {
 	ln, err := net.Listen("tcp", cfg.LMTPAddr)
 	if err != nil {
@@ -34,7 +33,7 @@ func runLMTPServer(ctx context.Context, cfg config, archiveStore *archive.SQLSto
 
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		ln.Close() // ctx 취소 시 Accept 블로킹 해제
 	}()
 
 	for {
@@ -52,16 +51,18 @@ func runLMTPServer(ctx context.Context, cfg config, archiveStore *archive.SQLSto
 			conn:    conn,
 			archive: archiveStore,
 			cfg:     cfg,
-		}).serve(ctx)
+		}).serve(ctx) // 클라이언트마다 고루틴을 생성해 동시 처리
 	}
 }
 
+// lmtpSession 은 단일 LMTP 클라이언트 연결의 상태를 보관합니다.
+// SMTP 명령어 파싱 → 본문 수신 → 아카이브 저장까지 한 세션을 담당합니다.
 type lmtpSession struct {
-	conn    net.Conn
-	archive *archive.SQLStore
+	conn    net.Conn          // 클라이언트 TCP 연결
+	archive *archive.SQLStore // 메시지를 저장할 아카이브 DB
 	cfg     config
-	from    string
-	rcpts   []string
+	from    string   // MAIL FROM 주소 (현재 트랜잭션)
+	rcpts   []string // RCPT TO 주소 목록 (현재 트랜잭션)
 }
 
 func (s *lmtpSession) serve(ctx context.Context) {
@@ -69,10 +70,11 @@ func (s *lmtpSession) serve(ctx context.Context) {
 	s.conn.SetDeadline(time.Now().Add(lmtpIdleTimeout)) //nolint:errcheck
 	maxMessageBytes := s.cfg.LMTPMaxMessageBytes
 	if maxMessageBytes <= 0 {
-		maxMessageBytes = 50 * 1024 * 1024
+		maxMessageBytes = 50 * 1024 * 1024 // 설정 누락 시 50 MB 기본값
 	}
 
 	rw := bufio.NewReadWriter(bufio.NewReaderSize(s.conn, 4096), bufio.NewWriter(s.conn))
+	// LMTP 세션 시작 배너 전송
 	s.reply(rw, "220 %s LMTP ready", s.domain())
 	rw.Flush() //nolint:errcheck
 
@@ -88,11 +90,13 @@ func (s *lmtpSession) serve(ctx context.Context) {
 
 		switch verb {
 		case "LHLO":
+			// LHLO는 SMTP의 EHLO에 해당 — LMTP 확장 기능 목록을 선언
 			s.reply(rw, "250-%s", s.domain())
 			s.reply(rw, "250-SIZE %d", maxMessageBytes)
 			s.reply(rw, "250 8BITMIME")
 
 		case "MAIL":
+			// 새 메일 트랜잭션 시작: 발신자 주소 저장 및 수신자 목록 초기화
 			s.from = extractLMTPAngle(arg)
 			s.rcpts = nil
 			s.reply(rw, "250 Ok")
@@ -101,6 +105,7 @@ func (s *lmtpSession) serve(ctx context.Context) {
 			if len(s.rcpts) >= lmtpMaxRcpts {
 				s.reply(rw, "452 Too many recipients")
 			} else {
+				// 수신자 주소를 목록에 추가
 				s.rcpts = append(s.rcpts, extractLMTPAngle(arg))
 				s.reply(rw, "250 Ok")
 			}
@@ -115,9 +120,10 @@ func (s *lmtpSession) serve(ctx context.Context) {
 				rw.Flush()                                          //nolint:errcheck
 				s.conn.SetDeadline(time.Now().Add(lmtpIdleTimeout)) //nolint:errcheck
 
+				// dot-stuffed 본문을 maxMessageBytes 한도 내에서 수신
 				raw, readErr := readLMTPDotData(rw.Reader, maxMessageBytes)
 
-				// Snapshot and reset envelope before sending per-recipient replies.
+				// 수신자 및 발신자를 스냅샷한 후 엔벨로프를 초기화 (RSET 효과)
 				from := s.from
 				rcpts := s.rcpts
 				s.from = ""
@@ -129,8 +135,10 @@ func (s *lmtpSession) serve(ctx context.Context) {
 						s.reply(rw, "552 Message too large or read error")
 					}
 				} else {
+					// MIME 파싱으로 제목과 본문을 추출
 					subject, textBody := parseLMTPMIME(raw)
 					receivedAt := time.Now().UTC()
+					// LMTP는 수신자별로 독립 응답을 반환 (SMTP와의 차이점)
 					for _, rcpt := range rcpts {
 						if delivErr := s.deliverOne(ctx, from, raw, subject, textBody, rcpt, receivedAt); delivErr != nil {
 							log.Printf("lmtp deliver to %s: %v", rcpt, delivErr)
@@ -143,6 +151,7 @@ func (s *lmtpSession) serve(ctx context.Context) {
 			}
 
 		case "RSET":
+			// 현재 트랜잭션 초기화 (발신자·수신자 목록 리셋)
 			s.from = ""
 			s.rcpts = nil
 			s.reply(rw, "250 Ok")
@@ -174,7 +183,7 @@ func (s *lmtpSession) reply(rw *bufio.ReadWriter, format string, args ...any) {
 	fmt.Fprintf(rw, format+"\r\n", args...) //nolint:errcheck
 }
 
-// deliverOne saves a single copy of the message addressed to rcpt in their inbound mailbox.
+// deliverOne 는 단일 수신자에 대해 메시지 한 부를 inbound 메일박스에 저장합니다.
 func (s *lmtpSession) deliverOne(ctx context.Context, from string, raw []byte, subject, textBody, rcpt string, receivedAt time.Time) error {
 	mailboxID, err := s.findOrCreateMailbox(ctx, rcpt, s.cfg.ArchiveInboundMailbox)
 	if err != nil {
@@ -194,8 +203,8 @@ func (s *lmtpSession) deliverOne(ctx context.Context, from string, raw []byte, s
 	return err
 }
 
-// findOrCreateMailbox returns the ID of the named mailbox for userEmail,
-// creating it if it does not exist. Handles concurrent creation races.
+// findOrCreateMailbox 는 userEmail 의 name 메일박스 ID를 반환합니다.
+// 존재하지 않으면 생성하며, 동시 생성 경쟁 조건은 두 번째 조회로 처리합니다.
 func (s *lmtpSession) findOrCreateMailbox(ctx context.Context, userEmail, name string) (string, error) {
 	boxes, err := s.archive.ListMailboxes(ctx, userEmail)
 	if err != nil {
@@ -208,7 +217,7 @@ func (s *lmtpSession) findOrCreateMailbox(ctx context.Context, userEmail, name s
 	}
 	box, err := s.archive.CreateMailbox(ctx, userEmail, name)
 	if err != nil {
-		// Race condition: another goroutine may have created it — retry once.
+		// 경쟁 조건: 다른 고루틴이 먼저 생성했을 수 있으므로 목록을 한 번 더 조회
 		boxes2, err2 := s.archive.ListMailboxes(ctx, userEmail)
 		if err2 != nil {
 			return "", fmt.Errorf("create mailbox for %s: %w", userEmail, err)
@@ -223,7 +232,7 @@ func (s *lmtpSession) findOrCreateMailbox(ctx context.Context, userEmail, name s
 	return box.ID, nil
 }
 
-// extractLMTPAngle extracts the email address from "FROM:<addr>" or "TO:<addr>" syntax.
+// extractLMTPAngle 은 "FROM:<addr>" 또는 "TO:<addr>" 구문에서 이메일 주소를 추출합니다.
 func extractLMTPAngle(s string) string {
 	i := strings.IndexByte(s, '<')
 	j := strings.LastIndexByte(s, '>')
@@ -236,7 +245,8 @@ func extractLMTPAngle(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// readLMTPDotData reads SMTP/LMTP dot-stuffed DATA until the lone "." terminator.
+// readLMTPDotData 는 SMTP/LMTP dot-stuffed DATA를 "." 종료 마커까지 읽습니다.
+// maxBytes를 초과하면 오류를 반환하여 메모리 과부하를 방지합니다.
 func readLMTPDotData(r *bufio.Reader, maxBytes int) ([]byte, error) {
 	var buf []byte
 	for {
@@ -244,11 +254,11 @@ func readLMTPDotData(r *bufio.Reader, maxBytes int) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Dot-transparency: leading ".." → "."
+		// dot-stuffing 해제: ".." 으로 시작하는 줄은 첫 "." 제거
 		if len(line) >= 2 && line[0] == '.' && line[1] == '.' {
 			line = line[1:]
 		}
-		// End-of-data marker: a line containing only "."
+		// 단독 "." 줄이 DATA 종료 마커
 		if bytes.Equal(bytes.TrimRight(line, "\r\n"), []byte(".")) {
 			break
 		}
@@ -260,8 +270,8 @@ func readLMTPDotData(r *bufio.Reader, maxBytes int) ([]byte, error) {
 	return buf, nil
 }
 
-// parseLMTPMIME extracts the Subject header and the first text/plain body part
-// from a raw RFC 5322 message.
+// parseLMTPMIME 는 raw RFC 5322 메시지에서 Subject 헤더와
+// 첫 번째 text/plain 파트의 본문을 추출합니다.
 func parseLMTPMIME(raw []byte) (subject, textBody string) {
 	msg, err := mail.ReadMessage(bytes.NewReader(raw))
 	if err != nil {
