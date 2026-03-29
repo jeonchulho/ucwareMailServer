@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/mail"
 	"net/smtp"
@@ -71,16 +72,21 @@ type SendMessageResponse struct {
 }
 
 const (
-	sendMaxAttachments      = 20
-	sendMaxAttachmentBytes  = 10 * 1024 * 1024
-	sendMaxTotalAttachBytes = 50 * 1024 * 1024
-	sendMultipartMemLimit   = 8 * 1024 * 1024
+	sendMaxAttachments          = 100
+	sendMaxAttachmentBytes      = int64(1024 * 1024 * 1024)     // 1 GB per file
+	sendMaxTotalAttachBytes     = int64(5 * 1024 * 1024 * 1024) // 5 GB total
+	sendMultipartMemLimit       = 8 * 1024 * 1024
+	sendJSONMaxAttachmentBytes  = int64(10 * 1024 * 1024)
+	sendJSONMaxTotalAttachBytes = int64(50 * 1024 * 1024)
+	sendArchiveRawMaxBytes      = int64(25 * 1024 * 1024)
 )
 
 type sendFilePayload struct {
 	Filename    string
 	ContentType string
+	SizeBytes   int64
 	Data        []byte
+	Open        func() (io.ReadCloser, error)
 }
 
 var errInvalidAutoRoute = errors.New("invalid auto route input")
@@ -406,6 +412,9 @@ func (s *Service) HandleSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll() //nolint:errcheck
+	}
 	req.FromAddr = strings.ToLower(strings.TrimSpace(req.FromAddr))
 	req.ToAddr = strings.ToLower(strings.TrimSpace(req.ToAddr))
 	req.Subject = strings.TrimSpace(req.Subject)
@@ -415,42 +424,66 @@ func (s *Service) HandleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	raw := strings.TrimSpace(req.RawMIME)
+	usedStreaming := false
 	if raw == "" {
-		if len(files) > 0 {
-			raw, err = buildMultipartMIME(req.FromAddr, req.ToAddr, req.Subject, req.TextBody, files)
-			if err != nil {
-				http.Error(w, "build multipart mime failed: "+err.Error(), http.StatusBadRequest)
-				return
-			}
-		} else if len(req.Attachments) > 0 {
+		if len(files) == 0 && len(req.Attachments) > 0 {
 			files, err = decodeJSONAttachments(req.Attachments)
 			if err != nil {
 				http.Error(w, "invalid attachments: "+err.Error(), http.StatusBadRequest)
 				return
 			}
-			raw, err = buildMultipartMIME(req.FromAddr, req.ToAddr, req.Subject, req.TextBody, files)
-			if err != nil {
-				http.Error(w, "build multipart mime failed: "+err.Error(), http.StatusBadRequest)
+		}
+
+		if len(files) > 0 {
+			usedStreaming = true
+			if err := validateFileCount(files); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-		} else {
-			raw = buildRawMIME(req.FromAddr, req.ToAddr, req.Subject, req.TextBody)
+			if err := s.sendMultipartSMTP(req.FromAddr, req.ToAddr, req.Subject, req.TextBody, files); err != nil {
+				s.writeAudit(r.Context(), "send_message", s.actorFromContext(r.Context()), req.ToAddr, "failed", err.Error(), r)
+				http.Error(w, "smtp send failed: "+err.Error(), http.StatusBadGateway)
+				return
+			}
+
+			meta := attachmentMetaFromFiles(files)
+			resp := SendMessageResponse{Status: "sent", Archived: false, AttachmentCount: len(meta), Attachments: meta}
+
+			if totalAttachmentBytes(files) <= sendArchiveRawMaxBytes {
+				raw, err = buildMultipartMIME(req.FromAddr, req.ToAddr, req.Subject, req.TextBody, files)
+				if err == nil {
+					archiveErr := s.archiveOutboundCopy(r.Context(), req, raw)
+					if archiveErr != nil {
+						resp.Warning = archiveErr.Error()
+					} else {
+						resp.Archived = true
+					}
+				} else {
+					resp.Warning = "message sent, but archive copy skipped: " + err.Error()
+				}
+			} else {
+				resp.Warning = fmt.Sprintf("message sent, but archive copy skipped for large attachments over %d bytes", sendArchiveRawMaxBytes)
+			}
+
+			s.writeAudit(r.Context(), "send_message", s.actorFromContext(r.Context()), req.ToAddr, "ok", "sent", r)
+			httpx.WriteJSON(w, http.StatusOK, resp)
+			return
 		}
+
+		raw = buildRawMIME(req.FromAddr, req.ToAddr, req.Subject, req.TextBody)
 	}
 
-	var auth smtp.Auth
-	if strings.TrimSpace(s.cfg.SMTPUsername) != "" {
-		host := strings.TrimSpace(s.cfg.SMTPRelayAddr)
-		if i := strings.Index(host, ":"); i >= 0 {
-			host = host[:i]
+	if !usedStreaming {
+		var auth smtp.Auth
+		if strings.TrimSpace(s.cfg.SMTPUsername) != "" {
+			auth = smtp.PlainAuth("", s.cfg.SMTPUsername, s.cfg.SMTPPassword, smtpHostFromAddr(s.cfg.SMTPRelayAddr))
 		}
-		auth = smtp.PlainAuth("", s.cfg.SMTPUsername, s.cfg.SMTPPassword, host)
-	}
 
-	if err := smtp.SendMail(s.cfg.SMTPRelayAddr, auth, req.FromAddr, []string{req.ToAddr}, []byte(raw)); err != nil {
-		s.writeAudit(r.Context(), "send_message", s.actorFromContext(r.Context()), req.ToAddr, "failed", err.Error(), r)
-		http.Error(w, "smtp send failed: "+err.Error(), http.StatusBadGateway)
-		return
+		if err := smtp.SendMail(s.cfg.SMTPRelayAddr, auth, req.FromAddr, []string{req.ToAddr}, []byte(raw)); err != nil {
+			s.writeAudit(r.Context(), "send_message", s.actorFromContext(r.Context()), req.ToAddr, "failed", err.Error(), r)
+			http.Error(w, "smtp send failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
 	}
 
 	meta := extractAttachmentMeta(raw)
@@ -667,22 +700,12 @@ func collectUploadedAttachments(form *multipart.Form) ([]sendFilePayload, error)
 	out := make([]sendFilePayload, 0, len(headers))
 	var total int64
 	for _, fh := range headers {
-		if fh.Size > sendMaxAttachmentBytes {
+		if fh.Size > 0 && fh.Size > sendMaxAttachmentBytes {
 			return nil, fmt.Errorf("attachment %s exceeds %d bytes", fh.Filename, sendMaxAttachmentBytes)
 		}
-		f, err := fh.Open()
-		if err != nil {
-			return nil, err
+		if fh.Size > 0 {
+			total += fh.Size
 		}
-		data, err := io.ReadAll(io.LimitReader(f, sendMaxAttachmentBytes+1))
-		_ = f.Close()
-		if err != nil {
-			return nil, err
-		}
-		if int64(len(data)) > sendMaxAttachmentBytes {
-			return nil, fmt.Errorf("attachment %s exceeds %d bytes", fh.Filename, sendMaxAttachmentBytes)
-		}
-		total += int64(len(data))
 		if total > sendMaxTotalAttachBytes {
 			return nil, fmt.Errorf("total attachment size exceeds %d bytes", sendMaxTotalAttachBytes)
 		}
@@ -690,10 +713,14 @@ func collectUploadedAttachments(form *multipart.Form) ([]sendFilePayload, error)
 		if strings.TrimSpace(ctype) == "" {
 			ctype = "application/octet-stream"
 		}
+		fhCopy := fh
 		out = append(out, sendFilePayload{
 			Filename:    filepath.Base(strings.TrimSpace(fh.Filename)),
 			ContentType: ctype,
-			Data:        data,
+			SizeBytes:   fh.Size,
+			Open: func() (io.ReadCloser, error) {
+				return fhCopy.Open()
+			},
 		})
 	}
 	return out, nil
@@ -714,73 +741,197 @@ func decodeJSONAttachments(items []SendAttachment) ([]sendFilePayload, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid base64 for %s", name)
 		}
-		if int64(len(decoded)) > sendMaxAttachmentBytes {
-			return nil, fmt.Errorf("attachment %s exceeds %d bytes", name, sendMaxAttachmentBytes)
+		if int64(len(decoded)) > sendJSONMaxAttachmentBytes {
+			return nil, fmt.Errorf("attachment %s exceeds %d bytes", name, sendJSONMaxAttachmentBytes)
 		}
 		total += int64(len(decoded))
-		if total > sendMaxTotalAttachBytes {
-			return nil, fmt.Errorf("total attachment size exceeds %d bytes", sendMaxTotalAttachBytes)
+		if total > sendJSONMaxTotalAttachBytes {
+			return nil, fmt.Errorf("total attachment size exceeds %d bytes", sendJSONMaxTotalAttachBytes)
 		}
 		ctype := strings.TrimSpace(it.ContentType)
 		if ctype == "" {
 			ctype = "application/octet-stream"
 		}
-		out = append(out, sendFilePayload{Filename: name, ContentType: ctype, Data: decoded})
+		out = append(out, sendFilePayload{Filename: name, ContentType: ctype, SizeBytes: int64(len(decoded)), Data: decoded})
 	}
 	return out, nil
 }
 
 func buildMultipartMIME(from, to, subject, body string, files []sendFilePayload) (string, error) {
-	var mimeBody bytes.Buffer
-	mw := multipart.NewWriter(&mimeBody)
+	var raw bytes.Buffer
+	if err := writeMultipartMIME(&raw, from, to, subject, body, files); err != nil {
+		return "", err
+	}
+	return raw.String(), nil
+}
+
+func (s *Service) sendMultipartSMTP(from, to, subject, body string, files []sendFilePayload) error {
+	client, err := smtp.Dial(s.cfg.SMTPRelayAddr)
+	if err != nil {
+		return err
+	}
+	defer client.Close() //nolint:errcheck
+
+	if strings.TrimSpace(s.cfg.SMTPUsername) != "" {
+		if ok, _ := client.Extension("AUTH"); ok {
+			auth := smtp.PlainAuth("", s.cfg.SMTPUsername, s.cfg.SMTPPassword, smtpHostFromAddr(s.cfg.SMTPRelayAddr))
+			if err := client.Auth(auth); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := client.Mail(from); err != nil {
+		return err
+	}
+	if err := client.Rcpt(to); err != nil {
+		return err
+	}
+
+	wc, err := client.Data()
+	if err != nil {
+		return err
+	}
+	if err := writeMultipartMIME(wc, from, to, subject, body, files); err != nil {
+		_ = wc.Close()
+		return err
+	}
+	if err := wc.Close(); err != nil {
+		return err
+	}
+	return client.Quit()
+}
+
+func writeMultipartMIME(w io.Writer, from, to, subject, body string, files []sendFilePayload) error {
+	mw := multipart.NewWriter(w)
+	date := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 +0000")
+	if _, err := fmt.Fprintf(w, "From: %s\r\n", from); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "To: %s\r\n", to); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "Subject: %s\r\n", subject); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "Date: %s\r\n", date); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "MIME-Version: 1.0\r\n"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "Content-Type: multipart/mixed; boundary=%q\r\n\r\n", mw.Boundary()); err != nil {
+		return err
+	}
 
 	textHeader := textproto.MIMEHeader{}
 	textHeader.Set("Content-Type", "text/plain; charset=utf-8")
 	textHeader.Set("Content-Transfer-Encoding", "8bit")
 	textPart, err := mw.CreatePart(textHeader)
 	if err != nil {
-		return "", err
+		return err
 	}
 	if _, err := textPart.Write([]byte(body)); err != nil {
-		return "", err
+		return err
 	}
 
+	var total int64
 	for _, f := range files {
-		if f.Filename == "" {
+		if strings.TrimSpace(f.Filename) == "" {
 			continue
 		}
-		h := textproto.MIMEHeader{}
-		h.Set("Content-Type", f.ContentType+`; name="`+f.Filename+`"`)
-		h.Set("Content-Disposition", `attachment; filename="`+f.Filename+`"`)
-		h.Set("Content-Transfer-Encoding", "base64")
-		part, err := mw.CreatePart(h)
+		partHeader := textproto.MIMEHeader{}
+		partHeader.Set("Content-Type", f.ContentType+`; name="`+f.Filename+`"`)
+		partHeader.Set("Content-Disposition", `attachment; filename="`+f.Filename+`"`)
+		partHeader.Set("Content-Transfer-Encoding", "base64")
+		part, err := mw.CreatePart(partHeader)
 		if err != nil {
-			return "", err
+			return err
 		}
+
+		rc, err := openSendFilePayload(f)
+		if err != nil {
+			return err
+		}
+		limitReader := io.LimitReader(rc, sendMaxAttachmentBytes+1)
 		enc := base64.NewEncoder(base64.StdEncoding, newBase64LineWriter(part))
-		if _, err := enc.Write(f.Data); err != nil {
-			_ = enc.Close()
-			return "", err
+		n, copyErr := io.Copy(enc, limitReader)
+		_ = rc.Close()
+		if closeErr := enc.Close(); closeErr != nil && copyErr == nil {
+			copyErr = closeErr
 		}
-		if err := enc.Close(); err != nil {
-			return "", err
+		if copyErr != nil {
+			return copyErr
+		}
+		if n > sendMaxAttachmentBytes {
+			return fmt.Errorf("attachment %s exceeds %d bytes", f.Filename, sendMaxAttachmentBytes)
+		}
+		total += n
+		if total > sendMaxTotalAttachBytes {
+			return fmt.Errorf("total attachment size exceeds %d bytes", sendMaxTotalAttachBytes)
 		}
 	}
 
 	if err := mw.Close(); err != nil {
-		return "", err
+		return err
 	}
+	return nil
+}
 
-	date := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 +0000")
-	var raw bytes.Buffer
-	fmt.Fprintf(&raw, "From: %s\r\n", from)
-	fmt.Fprintf(&raw, "To: %s\r\n", to)
-	fmt.Fprintf(&raw, "Subject: %s\r\n", subject)
-	fmt.Fprintf(&raw, "Date: %s\r\n", date)
-	raw.WriteString("MIME-Version: 1.0\r\n")
-	fmt.Fprintf(&raw, "Content-Type: multipart/mixed; boundary=%q\r\n\r\n", mw.Boundary())
-	raw.Write(mimeBody.Bytes())
-	return raw.String(), nil
+func openSendFilePayload(f sendFilePayload) (io.ReadCloser, error) {
+	if f.Open != nil {
+		return f.Open()
+	}
+	return io.NopCloser(bytes.NewReader(f.Data)), nil
+}
+
+func smtpHostFromAddr(addr string) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err == nil && host != "" {
+		return host
+	}
+	if i := strings.Index(strings.TrimSpace(addr), ":"); i >= 0 {
+		return strings.TrimSpace(addr[:i])
+	}
+	return strings.TrimSpace(addr)
+}
+
+func validateFileCount(files []sendFilePayload) error {
+	if len(files) > sendMaxAttachments {
+		return fmt.Errorf("attachments must be <= %d", sendMaxAttachments)
+	}
+	return nil
+}
+
+func totalAttachmentBytes(files []sendFilePayload) int64 {
+	var total int64
+	for _, f := range files {
+		if f.SizeBytes > 0 {
+			total += f.SizeBytes
+			continue
+		}
+		total += int64(len(f.Data))
+	}
+	return total
+}
+
+func attachmentMetaFromFiles(files []sendFilePayload) []archivetypes.AttachmentMeta {
+	out := make([]archivetypes.AttachmentMeta, 0, len(files))
+	for _, f := range files {
+		if strings.TrimSpace(f.Filename) == "" {
+			continue
+		}
+		mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(f.ContentType))
+		if err != nil || strings.TrimSpace(mediaType) == "" {
+			mediaType = "application/octet-stream"
+		}
+		size := f.SizeBytes
+		if size <= 0 {
+			size = int64(len(f.Data))
+		}
+		out = append(out, archivetypes.AttachmentMeta{Filename: f.Filename, ContentType: mediaType, SizeBytes: size})
+	}
+	return out
 }
 
 func extractAttachmentMeta(raw string) []archivetypes.AttachmentMeta {

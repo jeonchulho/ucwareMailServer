@@ -53,6 +53,13 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	lmtpMaxMessageBytes, err := envx.GetInt("LMTP_MAX_MESSAGE_BYTES", 200*1024*1024)
+	if err != nil {
+		return config{}, err
+	}
+	if lmtpMaxMessageBytes < 1024*1024 {
+		return config{}, fmt.Errorf("LMTP_MAX_MESSAGE_BYTES must be >= 1048576")
+	}
 	inboundMailbox := strings.TrimSpace(envx.Get("ARCHIVE_INBOUND_MAILBOX", "INBOX"))
 	if inboundMailbox == "" {
 		return config{}, fmt.Errorf("ARCHIVE_INBOUND_MAILBOX cannot be empty")
@@ -106,6 +113,7 @@ func loadConfig() (config, error) {
 		LMTPEnabled:                 lmtpEnabled,
 		LMTPAddr:                    envx.Get("LMTP_ADDR", ":2525"),
 		LMTPDomain:                  envx.Get("LMTP_DOMAIN", ""),
+		LMTPMaxMessageBytes:         lmtpMaxMessageBytes,
 		POP3Enabled:                 pop3Enabled,
 		POP3Addr:                    envx.Get("POP3_ADDR", ":110"),
 	}, nil

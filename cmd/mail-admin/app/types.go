@@ -52,6 +52,7 @@ type config struct {
 	LMTPEnabled                 bool
 	LMTPAddr                    string
 	LMTPDomain                  string
+	LMTPMaxMessageBytes         int
 	POP3Enabled                 bool
 	POP3Addr                    string
 }

@@ -18,9 +18,8 @@ import (
 )
 
 const (
-	lmtpMaxMessageBytes = 50 * 1024 * 1024 // 50 MB
-	lmtpMaxRcpts        = 100
-	lmtpIdleTimeout     = 5 * time.Minute
+	lmtpMaxRcpts    = 100
+	lmtpIdleTimeout = 5 * time.Minute
 )
 
 // runLMTPServer starts an LMTP listener that accepts mail deliveries from an MTA
@@ -68,6 +67,10 @@ type lmtpSession struct {
 func (s *lmtpSession) serve(ctx context.Context) {
 	defer s.conn.Close()
 	s.conn.SetDeadline(time.Now().Add(lmtpIdleTimeout)) //nolint:errcheck
+	maxMessageBytes := s.cfg.LMTPMaxMessageBytes
+	if maxMessageBytes <= 0 {
+		maxMessageBytes = 50 * 1024 * 1024
+	}
 
 	rw := bufio.NewReadWriter(bufio.NewReaderSize(s.conn, 4096), bufio.NewWriter(s.conn))
 	s.reply(rw, "220 %s LMTP ready", s.domain())
@@ -86,7 +89,7 @@ func (s *lmtpSession) serve(ctx context.Context) {
 		switch verb {
 		case "LHLO":
 			s.reply(rw, "250-%s", s.domain())
-			s.reply(rw, "250-SIZE %d", lmtpMaxMessageBytes)
+			s.reply(rw, "250-SIZE %d", maxMessageBytes)
 			s.reply(rw, "250 8BITMIME")
 
 		case "MAIL":
@@ -112,7 +115,7 @@ func (s *lmtpSession) serve(ctx context.Context) {
 				rw.Flush()                                          //nolint:errcheck
 				s.conn.SetDeadline(time.Now().Add(lmtpIdleTimeout)) //nolint:errcheck
 
-				raw, readErr := readLMTPDotData(rw.Reader, lmtpMaxMessageBytes)
+				raw, readErr := readLMTPDotData(rw.Reader, maxMessageBytes)
 
 				// Snapshot and reset envelope before sending per-recipient replies.
 				from := s.from
