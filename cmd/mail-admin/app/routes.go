@@ -2,14 +2,14 @@ package app
 
 import (
 	"net/http"
-	"os"
 
 	authsvc "github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/auth"
 	handlersvc "github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/handlers"
 	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/security"
+	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/web"
 )
 
-func buildMux(authService *authsvc.Service, handlerService *handlersvc.Service, staticDir string) *http.ServeMux {
+func buildMux(authService *authsvc.Service, handlerService *handlersvc.Service, ssrHandler *web.Handler) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handlerService.HandleHealthz)
 	mux.HandleFunc("/v1/auth/login", authService.HandleLogin)
@@ -32,11 +32,41 @@ func buildMux(authService *authsvc.Service, handlerService *handlersvc.Service, 
 	mux.Handle("/v1/mailboxes", authService.WithAuth(http.HandlerFunc(handlerService.HandleMailboxes), security.RoleViewer, security.RoleOperator, security.RoleAdmin))
 	mux.Handle("/v1/messages", authService.WithAuth(http.HandlerFunc(handlerService.HandleMessages), security.RoleViewer, security.RoleOperator, security.RoleAdmin))
 
-	// 프론트엔드 정적 파일 서빙 (STATIC_DIR)
-	if staticDir != "" {
-		if _, err := os.Stat(staticDir); err == nil {
-			mux.Handle("/", http.FileServer(http.Dir(staticDir)))
-		}
+	// ── SSR 라우트 ──────────────────────────────────────────────────────────
+	if ssrHandler != nil {
+		// 정적 애셋 (CSS 등)
+		mux.Handle("/static/", ssrHandler.StaticHandler())
+
+		// 인증 불필요
+		mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodGet:
+				ssrHandler.HandleLoginPage(w, r)
+			case http.MethodPost:
+				ssrHandler.HandleLoginSubmit(w, r)
+			default:
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			}
+		})
+		mux.HandleFunc("/logout", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Redirect(w, r, "/login", http.StatusSeeOther)
+				return
+			}
+			ssrHandler.HandleLogout(w, r)
+		})
+
+		// 세션 필요
+		protected := ssrHandler.RequireSession
+		mux.Handle("/", protected(http.HandlerFunc(ssrHandler.HandleRoot)))
+		mux.Handle("/mail/", protected(http.HandlerFunc(ssrHandler.HandleMail)))
+		mux.Handle("/compose", protected(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Redirect(w, r, "/mail/INBOX", http.StatusSeeOther)
+				return
+			}
+			ssrHandler.HandleCompose(w, r)
+		})))
 	}
 	return mux
 }

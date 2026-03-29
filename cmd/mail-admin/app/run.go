@@ -5,6 +5,8 @@ import (
 	"log"
 	"os/signal"
 	"syscall"
+
+	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/web"
 )
 
 func Run() {
@@ -37,7 +39,17 @@ func Run() {
 	if err != nil {
 		log.Fatalf("service init error: %v", err)
 	}
-	mux := buildMux(authService, handlerService, cfg.StaticDir)
+
+	webHandler, err := web.NewHandler(st, archiveStore, web.Config{
+		JWTSecret:    cfg.JWTSecret,
+		JWTIssuer:    cfg.JWTIssuer,
+		SecureCookie: false,
+	})
+	if err != nil {
+		log.Fatalf("web handler init error: %v", err)
+	}
+
+	mux := buildMux(authService, handlerService, webHandler)
 
 	if cfg.LMTPEnabled {
 		if archiveStore == nil {

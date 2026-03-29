@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UCware Mail — 로그인</title>
+  <link rel="stylesheet" href="/static/static/css/style.css">
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="login-card">
+    <div class="logo">UCware <span>M</span>ail</div>
+    <h2>로그인</h2>
+    <p>계속하려면 계정에 로그인하세요.</p>
+
+    <form method="POST" action="/login" autocomplete="on">
+      <div class="field">
+        <label for="email">이메일</label>
+        <input id="email" name="email" type="email" placeholder="admin@example.com" autocomplete="email" required>
+      </div>
+      <div class="field">
+        <label for="password">비밀번호</label>
+        <input id="password" name="password" type="password" placeholder="비밀번호" autocomplete="current-password" required>
+      </div>
+      {{if .Error}}
+      <div class="err">{{.Error}}</div>
+      {{end}}
+      <button class="btn-primary" type="submit">로그인</button>
+    </form>
+  </div>
+</div>
+
+</body>
+</html>
