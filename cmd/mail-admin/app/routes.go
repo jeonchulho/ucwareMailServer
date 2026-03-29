@@ -30,5 +30,6 @@ func buildMux(authService *authsvc.Service, handlerService *handlersvc.Service) 
 	mux.Handle("/v1/audits", authService.WithAuth(http.HandlerFunc(handlerService.HandleAudits), security.RoleOperator, security.RoleAdmin))
 	mux.Handle("/v1/mailboxes", authService.WithAuth(http.HandlerFunc(handlerService.HandleMailboxes), security.RoleViewer, security.RoleOperator, security.RoleAdmin))
 	mux.Handle("/v1/messages", authService.WithAuth(http.HandlerFunc(handlerService.HandleMessages), security.RoleViewer, security.RoleOperator, security.RoleAdmin))
+	mux.Handle("/v1/send", authService.WithAuth(http.HandlerFunc(handlerService.HandleSend), security.RoleOperator, security.RoleAdmin))
 	return mux
 }

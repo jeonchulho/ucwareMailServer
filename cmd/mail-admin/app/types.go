@@ -46,6 +46,9 @@ type config struct {
 	ArchiveAutoRouteEnabled     bool
 	ArchiveInboundMailbox       string
 	ArchiveOutboundMailbox      string
+	SMTPRelayAddr               string
+	SMTPUsername                string
+	SMTPPassword                string
 	LMTPEnabled                 bool
 	LMTPAddr                    string
 	LMTPDomain                  string

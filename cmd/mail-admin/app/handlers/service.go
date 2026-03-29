@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/mail"
+	"net/smtp"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +34,24 @@ type Config struct {
 	ArchiveAutoRouteEnabled bool
 	ArchiveInboundMailbox   string
 	ArchiveOutboundMailbox  string
+	SMTPRelayAddr           string
+	SMTPUsername            string
+	SMTPPassword            string
+}
+
+type SendMessageRequest struct {
+	FromAddr  string `json:"fromAddr"`
+	ToAddr    string `json:"toAddr"`
+	Subject   string `json:"subject"`
+	TextBody  string `json:"textBody"`
+	RawMIME   string `json:"rawMime"`
+	MailboxID string `json:"mailboxId"`
+}
+
+type SendMessageResponse struct {
+	Status   string `json:"status"`
+	Archived bool   `json:"archived"`
+	Warning  string `json:"warning,omitempty"`
 }
 
 var errInvalidAutoRoute = errors.New("invalid auto route input")
@@ -316,6 +335,117 @@ func (s *Service) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Service) HandleSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if strings.TrimSpace(s.cfg.SMTPRelayAddr) == "" {
+		http.Error(w, "SMTP_RELAY_ADDR is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	defer r.Body.Close()
+	var req SendMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.FromAddr = strings.ToLower(strings.TrimSpace(req.FromAddr))
+	req.ToAddr = strings.ToLower(strings.TrimSpace(req.ToAddr))
+	req.Subject = strings.TrimSpace(req.Subject)
+	if !isValidEmail(req.FromAddr) || !isValidEmail(req.ToAddr) {
+		http.Error(w, "fromAddr/toAddr are required and must be valid email", http.StatusBadRequest)
+		return
+	}
+
+	raw := strings.TrimSpace(req.RawMIME)
+	if raw == "" {
+		raw = buildRawMIME(req.FromAddr, req.ToAddr, req.Subject, req.TextBody)
+	}
+
+	var auth smtp.Auth
+	if strings.TrimSpace(s.cfg.SMTPUsername) != "" {
+		host := strings.TrimSpace(s.cfg.SMTPRelayAddr)
+		if i := strings.Index(host, ":"); i >= 0 {
+			host = host[:i]
+		}
+		auth = smtp.PlainAuth("", s.cfg.SMTPUsername, s.cfg.SMTPPassword, host)
+	}
+
+	if err := smtp.SendMail(s.cfg.SMTPRelayAddr, auth, req.FromAddr, []string{req.ToAddr}, []byte(raw)); err != nil {
+		s.writeAudit(r.Context(), "send_message", s.actorFromContext(r.Context()), req.ToAddr, "failed", err.Error(), r)
+		http.Error(w, "smtp send failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	resp := SendMessageResponse{Status: "sent", Archived: false}
+	archiveErr := s.archiveOutboundCopy(r.Context(), req, raw)
+	if archiveErr != nil {
+		resp.Warning = archiveErr.Error()
+	} else {
+		resp.Archived = true
+	}
+
+	s.writeAudit(r.Context(), "send_message", s.actorFromContext(r.Context()), req.ToAddr, "ok", "sent", r)
+	httpx.WriteJSON(w, http.StatusOK, resp)
+}
+
+func (s *Service) archiveOutboundCopy(ctx context.Context, req SendMessageRequest, raw string) error {
+	if s.archive == nil {
+		return fmt.Errorf("archive db is disabled")
+	}
+
+	mailboxID := strings.TrimSpace(req.MailboxID)
+	if mailboxID == "" {
+		if s.cfg.ArchiveAutoRouteEnabled {
+			id, err := s.resolveMailboxIDForAutoRoute(ctx, "outbound", req.FromAddr, req.ToAddr)
+			if err != nil {
+				return fmt.Errorf("archive route failed: %w", err)
+			}
+			mailboxID = id
+		} else {
+			boxes, err := s.archive.ListMailboxes(ctx, req.FromAddr)
+			if err != nil {
+				return fmt.Errorf("archive list mailboxes failed: %w", err)
+			}
+			mailboxName := strings.TrimSpace(s.cfg.ArchiveOutboundMailbox)
+			if mailboxName == "" {
+				mailboxName = "SENT"
+			}
+			for _, b := range boxes {
+				if strings.EqualFold(strings.TrimSpace(b.Name), mailboxName) {
+					mailboxID = b.ID
+					break
+				}
+			}
+			if mailboxID == "" {
+				mb, err := s.archive.CreateMailbox(ctx, req.FromAddr, mailboxName)
+				if err != nil {
+					return fmt.Errorf("archive create mailbox failed: %w", err)
+				}
+				mailboxID = mb.ID
+			}
+		}
+	}
+
+	_, err := s.archive.CreateMessage(ctx, archive.CreateMessageInput{
+		MailboxID:  mailboxID,
+		Direction:  "outbound",
+		FromAddr:   req.FromAddr,
+		ToAddr:     req.ToAddr,
+		Subject:    req.Subject,
+		RawMIME:    raw,
+		TextBody:   req.TextBody,
+		SizeBytes:  int64(len(raw)),
+		ReceivedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return fmt.Errorf("archive create message failed: %w", err)
+	}
+	return nil
+}
+
 func (s *Service) listUsers(w http.ResponseWriter, r *http.Request) {
 	users, err := s.store.ListUsers(r.Context())
 	if err != nil {
@@ -409,6 +539,21 @@ func isValidEmail(value string) bool {
 		return false
 	}
 	return strings.EqualFold(addr.Address, value)
+}
+
+func buildRawMIME(from, to, subject, body string) string {
+	date := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 +0000")
+	return strings.Join([]string{
+		"From: " + from,
+		"To: " + to,
+		"Subject: " + subject,
+		"Date: " + date,
+		"MIME-Version: 1.0",
+		"Content-Type: text/plain; charset=utf-8",
+		"Content-Transfer-Encoding: 8bit",
+		"",
+		body,
+	}, "\r\n")
 }
 
 func (s *Service) EnsureInitialSync(ctx context.Context) error {
