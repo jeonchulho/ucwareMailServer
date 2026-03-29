@@ -16,12 +16,14 @@ import (
 )
 
 const (
-	pop3IdleTimeout  = 10 * time.Minute
+	// 유휴 연결 타임아웃. 클라이언트가 오랫동안 명령을 보내지 않으면 세션을 종료한다.
+	pop3IdleTimeout = 10 * time.Minute
+	// 인증 실패 허용 횟수. 초과 시 연결을 종료해 무차별 대입 시도를 완화한다.
 	pop3MaxAuthFails = 3
 )
 
-// runPOP3Server starts a POP3 listener so mail clients can retrieve messages
-// from the archive DB. It blocks until ctx is cancelled.
+// runPOP3Server 는 POP3 TCP 리스너를 시작해 메일 클라이언트가 아카이브 DB 메시지를
+// 조회/다운로드할 수 있게 한다. ctx 취소 시 리스너를 닫고 정상 종료한다.
 func runPOP3Server(ctx context.Context, cfg config, userStore *store.SQLiteStore, archiveStore *archive.SQLStore) error {
 	ln, err := net.Listen("tcp", cfg.POP3Addr)
 	if err != nil {
@@ -54,30 +56,37 @@ func runPOP3Server(ctx context.Context, cfg config, userStore *store.SQLiteStore
 	}
 }
 
-// pop3Msg holds envelope info for one message in the current session.
+// pop3Msg 는 현재 POP3 세션에서 메일 1건의 최소 메타데이터를 담는다.
+// deleted=true 는 DB 즉시 삭제가 아니라 QUIT 시점 커밋 대상임을 의미한다.
 type pop3Msg struct {
 	id      string
 	size    int64
 	deleted bool
 }
 
-// pop3Session handles a single POP3 client connection.
+// pop3Session 은 단일 POP3 클라이언트 연결의 상태를 관리한다.
+// POP3 상태 머신(AUTHORIZATION -> TRANSACTION)을 이 구조체가 유지한다.
 type pop3Session struct {
 	conn      net.Conn
 	userStore *store.SQLiteStore
 	archive   *archive.SQLStore
 	cfg       config
 
-	// set after successful authentication
+	// 인증 성공 후 설정되는 세션 사용자 정보
 	userEmail string
-	messages  []pop3Msg
+	// 현재 메일드롭 스냅샷(세션 시작 시 로드)
+	messages []pop3Msg
 }
 
 const (
+	// 인증 전 상태(USER/PASS/QUIT 허용)
 	stateAuth = iota
+	// 인증 후 트랜잭션 상태(STAT/LIST/RETR/DELE 등 허용)
 	stateTxn
 )
 
+// serve 는 POP3 세션 메인 루프로, 명령 파싱/상태 전이/응답 작성을 처리한다.
+// 소켓은 유휴 타임아웃을 주기적으로 갱신해 장시간 유휴 연결을 정리한다.
 func (s *pop3Session) serve(ctx context.Context) {
 	defer s.conn.Close()
 	s.conn.SetDeadline(time.Now().Add(pop3IdleTimeout)) //nolint:errcheck
@@ -103,7 +112,7 @@ func (s *pop3Session) serve(ctx context.Context) {
 
 		switch state {
 
-		// ── AUTHORIZATION state ──────────────────────────────────────────────
+		// ── AUTHORIZATION 상태 ───────────────────────────────────────────────
 		case stateAuth:
 			switch verb {
 			case "USER":
@@ -151,7 +160,7 @@ func (s *pop3Session) serve(ctx context.Context) {
 				s.err(rw, "unknown command")
 			}
 
-		// ── TRANSACTION state ─────────────────────────────────────────────────
+		// ── TRANSACTION 상태 ──────────────────────────────────────────────────
 		case stateTxn:
 			switch verb {
 			case "STAT":
@@ -211,7 +220,7 @@ func (s *pop3Session) serve(ctx context.Context) {
 				}
 
 			case "TOP":
-				// TOP msg n — headers + blank line + n body lines
+				// TOP msg n: 헤더 + 빈 줄 + 본문 n줄만 반환
 				parts := strings.SplitN(arg, " ", 2)
 				if len(parts) != 2 {
 					s.err(rw, "syntax: TOP msg n")
@@ -252,7 +261,7 @@ func (s *pop3Session) serve(ctx context.Context) {
 				s.ok(rw, "")
 
 			case "QUIT":
-				// UPDATE state: commit deletions
+				// UPDATE 상태: DELE 표시된 메시지를 실제 DB에서 삭제 커밋
 				s.commitDeletions(ctx)
 				s.ok(rw, "bye")
 				rw.Flush() //nolint:errcheck
@@ -267,7 +276,7 @@ func (s *pop3Session) serve(ctx context.Context) {
 	}
 }
 
-// authenticate checks the given plaintext password against the stored bcrypt hash.
+// authenticate 는 입력한 평문 비밀번호를 저장된 bcrypt 해시와 비교해 인증한다.
 func (s *pop3Session) authenticate(ctx context.Context, email, password string) error {
 	users, err := s.userStore.ListUsersByEmail(ctx, email)
 	if err != nil {
@@ -279,7 +288,8 @@ func (s *pop3Session) authenticate(ctx context.Context, email, password string) 
 	return bcrypt.CompareHashAndPassword([]byte(users[0].PasswordHash), []byte(password))
 }
 
-// loadMailbox fetches all messages in the user's inbound mailbox into memory.
+// loadMailbox 는 사용자 인바운드 메일박스의 메시지 목록을 세션 메모리로 로드한다.
+// 메일박스가 아직 없으면 오류가 아니라 빈 메일드롭으로 간주한다.
 func (s *pop3Session) loadMailbox(ctx context.Context) error {
 	boxes, err := s.archive.ListMailboxes(ctx, s.userEmail)
 	if err != nil {
@@ -294,7 +304,7 @@ func (s *pop3Session) loadMailbox(ctx context.Context) error {
 		}
 	}
 	if mailboxID == "" {
-		// No inbox yet — empty maildrop is valid.
+		// 인박스 미생성 상태는 유효하므로 빈 목록으로 처리
 		s.messages = nil
 		return nil
 	}
@@ -309,7 +319,8 @@ func (s *pop3Session) loadMailbox(ctx context.Context) error {
 	return nil
 }
 
-// commitDeletions deletes all messages marked for deletion from the DB.
+// commitDeletions 는 DELE로 삭제 표시된 메시지를 DB에서 실제 삭제한다.
+// POP3 규약상 QUIT 시점(UPDATE 상태)에 반영한다.
 func (s *pop3Session) commitDeletions(ctx context.Context) {
 	for _, m := range s.messages {
 		if m.deleted {
@@ -320,7 +331,7 @@ func (s *pop3Session) commitDeletions(ctx context.Context) {
 	}
 }
 
-// stat returns the count and total byte size of non-deleted messages.
+// stat 은 삭제되지 않은 메시지 개수와 총 바이트 크기를 계산한다.
 func (s *pop3Session) stat() (count int, total int64) {
 	for _, m := range s.messages {
 		if !m.deleted {
@@ -331,7 +342,8 @@ func (s *pop3Session) stat() (count int, total int64) {
 	return
 }
 
-// parseIndex parses a 1-based message number and returns the 0-based index.
+// parseIndex 는 POP3 1-based 메시지 번호를 내부 0-based 인덱스로 변환한다.
+// 범위 밖 번호이거나 이미 DELE 처리된 메시지는 false를 반환한다.
 func (s *pop3Session) parseIndex(raw string) (int, bool) {
 	n, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil || n < 1 || n > len(s.messages) {
@@ -344,6 +356,8 @@ func (s *pop3Session) parseIndex(raw string) (int, bool) {
 	return idx, true
 }
 
+// ok 는 POP3 성공 응답(+OK)을 작성한다.
+// format이 비어 있으면 상태라인만 보낸다.
 func (s *pop3Session) ok(rw *bufio.ReadWriter, format string, args ...any) {
 	if format == "" {
 		fmt.Fprintf(rw, "+OK\r\n") //nolint:errcheck
@@ -352,11 +366,13 @@ func (s *pop3Session) ok(rw *bufio.ReadWriter, format string, args ...any) {
 	fmt.Fprintf(rw, "+OK "+format+"\r\n", args...) //nolint:errcheck
 }
 
+// err 는 POP3 오류 응답(-ERR)을 작성한다.
 func (s *pop3Session) err(rw *bufio.ReadWriter, format string, args ...any) {
 	fmt.Fprintf(rw, "-ERR "+format+"\r\n", args...) //nolint:errcheck
 }
 
-// writePOP3DotData writes data followed by the dot terminator, applying dot-stuffing.
+// writePOP3DotData 는 POP3 멀티라인 응답 규약에 맞춰 본문을 기록한다.
+// 줄 시작이 '.'인 경우 dot-stuffing(점 하나 추가)을 적용하고, 마지막에 "." 종료줄을 붙인다.
 func writePOP3DotData(rw *bufio.ReadWriter, data []byte) {
 	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
 	for _, line := range lines {
@@ -369,13 +385,14 @@ func writePOP3DotData(rw *bufio.ReadWriter, data []byte) {
 	fmt.Fprintf(rw, ".\r\n") //nolint:errcheck
 }
 
-// topLines returns the header section + a blank line + at most n body lines.
+// topLines 는 TOP 명령용으로 "헤더 + 빈 줄 + 본문 최대 n줄"을 반환한다.
+// 헤더/본문 구분선이 없으면 원본을 그대로 반환한다.
 func topLines(raw []byte, n int) []byte {
 	text := strings.ReplaceAll(string(raw), "\r\n", "\n")
-	// Find the header/body separator (first blank line).
+	// 헤더/본문 구분(첫 빈 줄) 위치를 찾는다.
 	sepIdx := strings.Index(text, "\n\n")
 	if sepIdx < 0 {
-		// No body — return full text.
+		// 본문 구분이 없으면 원문 그대로 반환
 		return raw
 	}
 	header := text[:sepIdx+2] // includes the blank line

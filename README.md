@@ -2,9 +2,12 @@
 
 Postfix + Dovecot 기반 메일 서버를 직접 운영하면서, Go API로 메일 계정/매핑 파일을 관리하는 프로젝트입니다.
 
-실행 절차를 순서대로 따라가려면 다음 문서를 먼저 확인하세요.
+## 가이드 문서
 
-- [MAIL_SERVER_RUN_GUIDE_KO.md](MAIL_SERVER_RUN_GUIDE_KO.md)
+처음 시작할 때는 아래 순서로 문서를 보면 가장 빠르게 전체 구조를 이해할 수 있습니다.
+
+1. [MAIL_SERVER_RUN_GUIDE_KO.md](MAIL_SERVER_RUN_GUIDE_KO.md): 로컬 실행 절차(준비 -> 실행 -> 점검)
+2. [POSTFIX_DOVECOT_SYSTEMD_GUIDE_KO.md](POSTFIX_DOVECOT_SYSTEMD_GUIDE_KO.md): Postfix/Dovecot/Rspamd/ICAP/systemd 운영 레퍼런스
 
 ## 아키텍처
 
