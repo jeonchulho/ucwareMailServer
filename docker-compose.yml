@@ -4,12 +4,17 @@ services:
       context: .
       dockerfile: deploy/docker/mail-admin/Dockerfile
     container_name: mail-admin
+    depends_on:
+      - archive-db
     user: "0:0"
     environment:
       ADDR: :8080
       JWT_SECRET: ${MAIL_ADMIN_JWT_SECRET:-change-this-jwt-secret}
       JWT_ISSUER: ${MAIL_ADMIN_JWT_ISSUER:-ucware-mail-admin}
       JWT_EXPIRY_MINUTES: ${MAIL_ADMIN_JWT_EXPIRY_MINUTES:-60}
+      ARCHIVE_DB_ENABLED: ${ARCHIVE_DB_ENABLED:-true}
+      ARCHIVE_DB_DRIVER: ${ARCHIVE_DB_DRIVER:-postgres}
+      ARCHIVE_DSN: ${ARCHIVE_DSN:-postgres://mail:mailpw@archive-db:5432/mailarchive?sslmode=disable}
       POP3_ENABLED: ${APP_POP3_ENABLED:-false}
       POP3_ADDR: :110
       BOOTSTRAP_ADMIN_EMAIL: ${MAIL_ADMIN_EMAIL:-admin@example.com}
@@ -29,6 +34,16 @@ services:
     ports:
       - "8080:8080"
       - "${APP_POP3_PORT:-2111}:110"
+
+  archive-db:
+    image: postgres:16
+    container_name: archive-db
+    environment:
+      POSTGRES_USER: ${ARCHIVE_DB_USER:-mail}
+      POSTGRES_PASSWORD: ${ARCHIVE_DB_PASSWORD:-mailpw}
+      POSTGRES_DB: ${ARCHIVE_DB_NAME:-mailarchive}
+    volumes:
+      - archive_db_data:/var/lib/postgresql/data
 
   postfix:
     build:
@@ -114,3 +129,4 @@ services:
 volumes:
   vmail:
   postfix_spool:
+  archive_db_data:
