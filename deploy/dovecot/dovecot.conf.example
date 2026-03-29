@@ -1,22 +1,30 @@
+# 활성 프로토콜: IMAP(조회), LMTP(전달)
 protocols = imap lmtp
+# 모든 인터페이스 리슨
 listen = *
 
+# 도메인/사용자 기반 Maildir 저장 경로
 mail_location = maildir:/var/mail/vhosts/%d/%n
+# 메일 파일 소유 UID 범위(고정 사용자 계정)
 first_valid_uid = 5000
 last_valid_uid = 5000
 
+# 인증 방식
 auth_mechanisms = plain login
 
+# passwd-file 기반 인증 정보 소스
 passdb {
   driver = passwd-file
   args = scheme=BLF-CRYPT username_format=%u /etc/dovecot/users.passwd
 }
 
+# 가상 사용자 속성(uid/gid/home) 매핑
 userdb {
   driver = static
   args = uid=5000 gid=5000 home=/var/mail/vhosts/%d/%n
 }
 
+# Postfix SASL 인증 위임 소켓
 service auth {
   unix_listener /var/spool/postfix/private/auth {
     mode = 0660
@@ -25,6 +33,7 @@ service auth {
   }
 }
 
+# Postfix가 메일 전달 시 사용할 LMTP 소켓
 service lmtp {
   unix_listener /var/spool/postfix/private/dovecot-lmtp {
     mode = 0600
@@ -33,6 +42,8 @@ service lmtp {
   }
 }
 
+# 운영 권장: TLS 필수
 ssl = required
+# 실제 인증서 경로로 교체 필요
 ssl_cert = </etc/letsencrypt/live/mail.example.com/fullchain.pem
 ssl_key = </etc/letsencrypt/live/mail.example.com/privkey.pem

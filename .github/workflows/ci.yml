@@ -1,17 +1,23 @@
 name: CI
 
 on:
+  # main 브랜치에 직접 푸시될 때 전체 CI 파이프라인 실행
   push:
     branches: [main]
+  # main 대상 PR에서도 동일 검증을 실행해 머지 전 품질 확보
   pull_request:
     branches: [main]
 
 permissions:
+  # 코드 체크아웃/메타데이터 읽기 권한
   contents: read
+  # Trivy SARIF 업로드(보안 탭 기록) 권한
   security-events: write
 
 env:
+  # 컨테이너 이미지 푸시 대상 레지스트리
   REGISTRY: ghcr.io
+  # 기본 이미지 이름(ghcr.io/<owner>/<repo>/mail-admin)
   IMAGE_NAME: ${{ github.repository }}/mail-admin
 
 jobs:
@@ -22,18 +28,22 @@ jobs:
     name: Lint & Test
     runs-on: ubuntu-latest
     steps:
+      # 저장소 소스 체크아웃
       - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
+          # go.mod의 버전을 기준으로 런타임 설치
           go-version-file: go.mod
+          # 모듈/빌드 캐시 활성화로 CI 시간 단축
           cache: true
 
       - name: go vet
         run: go vet ./...
 
       - name: go test
+        # race detector + 커버리지 파일 생성
         run: go test -race -coverprofile=coverage.out ./...
 
       - name: Upload coverage
@@ -49,6 +59,7 @@ jobs:
   go-vulncheck:
     name: Go Vulnerability Scan
     runs-on: ubuntu-latest
+    # 테스트가 통과한 코드 기준으로 취약점 스캔
     needs: lint-and-test
     steps:
       - uses: actions/checkout@v4
@@ -60,6 +71,7 @@ jobs:
           cache: true
 
       - name: Run govulncheck
+        # Go 취약점 DB 기반 정적 취약점 스캔
         uses: golang/govulncheck-action@v1
         with:
           go-version-file: go.mod
@@ -71,6 +83,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    # 품질/취약점 선행 검증 완료 후 빌드 단계 진입
     needs:
       - lint-and-test
       - go-vulncheck
@@ -87,6 +100,7 @@ jobs:
           cache: true
 
       - name: Build binary (linux/amd64)
+        # 버전 문자열에 short SHA를 주입한 정적 바이너리 생성
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
             go build -trimpath -ldflags "-s -w -X main.Version=${GITHUB_SHA::8}" \
@@ -104,6 +118,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
+        # main 푸시에서만 로그인/푸시 수행(PR에서는 빌드만)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
@@ -113,6 +128,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
+        # 태그 전략: sha, 브랜치, semver, main의 latest
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -124,6 +140,7 @@ jobs:
 
       - name: Build (and push on main)
         id: push
+        # PR에서는 이미지 빌드만 검증, main 푸시 시 실제 푸시
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -141,6 +158,7 @@ jobs:
   image-vulnerability-scan:
     name: Image Vulnerability Scan
     runs-on: ubuntu-latest
+    # 빌드 결과 기준으로 컨테이너 이미지 취약점 검사
     needs: build
     steps:
       - uses: actions/checkout@v4
@@ -153,6 +171,7 @@ jobs:
             .
 
       - name: Run Trivy image scan (CRITICAL,HIGH)
+        # 고위험 이상 취약점 발견 시 실패(exit-code 1)
         uses: aquasecurity/trivy-action@0.24.0
         with:
           image-ref: local/mail-admin:ci-scan
@@ -164,6 +183,7 @@ jobs:
           exit-code: '1'
 
       - name: Upload Trivy scan to GitHub Security tab
+        # 성공/실패와 무관하게 결과 업로드
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
@@ -178,6 +198,7 @@ jobs:
     needs:
       - build
       - image-vulnerability-scan
+    # main 브랜치 기준으로만 통합 E2E를 실행해 CI 비용 관리
     if: ${{ github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v4
@@ -195,6 +216,7 @@ jobs:
         run: docker compose version
 
       - name: Create .env for E2E
+        # 테스트 전용 환경 변수 파일 생성(실운영 값과 분리)
         run: |
           cat > .env << 'EOF'
           MAIL_DOMAIN=example.test
@@ -213,6 +235,7 @@ jobs:
 
       - name: Upload compose logs on failure
         if: failure()
+        # 실패 원인 분석용 compose 로그 수집
         run: docker compose logs --no-color > compose-failure.log 2>&1 || true
 
       - name: Upload failure logs artifact
@@ -232,6 +255,7 @@ jobs:
     needs:
       - build
       - image-vulnerability-scan
+    # main에서만 실행, 보안 체인 테스트는 시간이 오래 걸리므로 타임아웃 상향
     if: ${{ github.ref == 'refs/heads/main' }}
     timeout-minutes: 20
     steps:
@@ -241,6 +265,7 @@ jobs:
         run: docker compose version
 
       - name: Create .env for security test
+        # 보안 테스트 전용 환경 변수
         run: |
           cat > .env << 'EOF'
           MAIL_DOMAIN=example.test
@@ -254,10 +279,12 @@ jobs:
           EOF
 
       - name: Run EICAR security chain test
+        # EICAR 시그니처를 사용해 바이러스 탐지 체인 동작 검증
         run: chmod +x scripts/e2e-security-eicar.sh && ./scripts/e2e-security-eicar.sh
 
       - name: Upload security logs on failure
         if: failure()
+        # 실패 시 compose 로그 + 컨테이너 상태를 같이 수집
         run: |
           docker compose logs --no-color > compose-security-failure.log 2>&1 || true
           docker compose ps -a > compose-security-ps.log 2>&1 || true
@@ -273,6 +300,7 @@ jobs:
           retention-days: 3
 
       - name: Cleanup compose stack
+        # 항상 정리하여 러너 자원 누수 방지
         if: always()
         run: docker compose down -v || true
 
@@ -285,6 +313,7 @@ jobs:
     needs:
       - build
       - image-vulnerability-scan
+    # 외부 ICAP 연동 모사 테스트도 main에서만 실행
     if: ${{ github.ref == 'refs/heads/main' }}
     timeout-minutes: 20
     steps:
@@ -294,6 +323,7 @@ jobs:
         run: docker compose version
 
       - name: Create .env for V3 mock test
+        # mock ICAP 서버 연동용 변수 포함
         run: |
           cat > .env << 'EOF'
           MAIL_DOMAIN=example.test
@@ -314,6 +344,7 @@ jobs:
 
       - name: Upload V3 mock logs on failure
         if: failure()
+        # v3mock 프로파일 로그/상태 수집
         run: |
           docker compose --profile v3mock logs --no-color > compose-v3mock-failure.log 2>&1 || true
           docker compose --profile v3mock ps -a > compose-v3mock-ps.log 2>&1 || true
@@ -329,5 +360,6 @@ jobs:
           retention-days: 3
 
       - name: Cleanup V3 mock compose stack
+        # 항상 스택 종료/볼륨 제거
         if: always()
         run: docker compose --profile v3mock down -v || true

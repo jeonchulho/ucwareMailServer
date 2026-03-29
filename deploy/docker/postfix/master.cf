@@ -1,9 +1,12 @@
+# SMTP(25) 인바운드 수신 서비스
 smtp      inet  n       -       y       -       -       smtpd
+# Submission(587) 인증 발송 서비스
 submission inet n       -       y       -       -       smtpd
   -o syslog_name=postfix/submission
   -o smtpd_tls_security_level=may
   -o smtpd_sasl_auth_enable=yes
 
+# 아래는 Postfix 내부 큐/전달/유틸리티 프로세스 정의
 pickup    unix  n       -       y       60      1       pickup
 cleanup   unix  n       -       y       -       0       cleanup
 qmgr      unix  n       -       n       300     1       qmgr
@@ -24,6 +27,7 @@ retry     unix  -       -       y       -       -       error
 discard   unix  -       -       y       -       -       discard
 local     unix  -       n       n       -       -       local
 virtual   unix  -       n       n       -       -       virtual
+# LMTP 클라이언트(예: Dovecot LMTP 전달 경로)
 lmtp      unix  -       -       y       -       -       lmtp
 anvil     unix  -       -       y       -       1       anvil
 scache    unix  -       -       y       -       1       scache

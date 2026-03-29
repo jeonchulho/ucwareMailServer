@@ -2,6 +2,10 @@
 
 Postfix + Dovecot 기반 메일 서버를 직접 운영하면서, Go API로 메일 계정/매핑 파일을 관리하는 프로젝트입니다.
 
+실행 절차를 순서대로 따라가려면 다음 문서를 먼저 확인하세요.
+
+- [MAIL_SERVER_RUN_GUIDE_KO.md](MAIL_SERVER_RUN_GUIDE_KO.md)
+
 ## 아키텍처
 
 - Postfix: SMTP 수신/발신

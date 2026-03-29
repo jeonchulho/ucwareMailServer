@@ -1,4 +1,8 @@
+# 로컬 통합 개발/검증용 메일 스택 구성
+# 웹 UI(web-frontend) + 관리 API(mail-admin) + 메일 전송/수신(Postfix/Dovecot)
+# 보안 체인(Rspamd/ClamAV, 선택적 mock-icap) + 테스트용 웹메일(roundcube)
 services:
+  # 사용자 웹 프론트엔드 (브라우저 진입점)
   web-frontend:
     build:
       context: .
@@ -7,73 +11,101 @@ services:
     depends_on:
       - mail-admin
     environment:
+      # 웹 서버 리슨 주소
       WEB_ADDR: :8090
+      # 프론트엔드가 호출할 내부 API 주소(컨테이너 네트워크 기준)
       API_BASE_URL: http://mail-admin:8080
+      # 로컬 개발 편의를 위해 Secure 쿠키 비활성화(운영에서는 true 권장)
       WEB_SECURE_COOKIE: "false"
     ports:
       - "8082:8090"
 
+  # 메일 관리자 API (인증/사용자 관리/아카이브/발송)
   mail-admin:
     build:
       context: .
       dockerfile: deploy/docker/mail-admin/Dockerfile
     container_name: mail-admin
     depends_on:
+      # 아카이브 DB 준비 후 기동
       - archive-db
+    # generated/data 경로 권한 문제를 피하기 위해 root로 실행
     user: "0:0"
     environment:
+      # HTTP API 바인드 주소
       ADDR: :8080
+      # JWT 인증 설정
       JWT_SECRET: ${MAIL_ADMIN_JWT_SECRET:-change-this-jwt-secret}
       JWT_ISSUER: ${MAIL_ADMIN_JWT_ISSUER:-ucware-mail-admin}
       JWT_EXPIRY_MINUTES: ${MAIL_ADMIN_JWT_EXPIRY_MINUTES:-60}
+
+      # 아카이브 DB 연동 설정
       ARCHIVE_DB_ENABLED: ${ARCHIVE_DB_ENABLED:-true}
       ARCHIVE_DB_DRIVER: ${ARCHIVE_DB_DRIVER:-postgres}
       ARCHIVE_DSN: ${ARCHIVE_DSN:-postgres://mail:mailpw@archive-db:5432/mailarchive?sslmode=disable}
+
+      # SMTP 릴레이(발송) 경로 설정
       SMTP_RELAY_ADDR: ${SMTP_RELAY_ADDR:-postfix:587}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+
+      # 로그인/발송 레이트리밋 및 계정 잠금 정책
       LOGIN_IP_RATE_LIMIT_PER_MIN: ${LOGIN_IP_RATE_LIMIT_PER_MIN:-30}
       LOGIN_FAIL_THRESHOLD: ${LOGIN_FAIL_THRESHOLD:-5}
       LOGIN_LOCK_MINUTES: ${LOGIN_LOCK_MINUTES:-15}
       SEND_RATE_LIMIT_PER_MIN: ${SEND_RATE_LIMIT_PER_MIN:-60}
+
+      # 내장 LMTP/POP3 서버 옵션
       LMTP_ENABLED: ${LMTP_ENABLED:-false}
       LMTP_MAX_MESSAGE_BYTES: ${LMTP_MAX_MESSAGE_BYTES:-209715200}
       POP3_ENABLED: ${APP_POP3_ENABLED:-false}
       POP3_ADDR: :110
+
+      # 최초 부트스트랩 관리자 계정
       BOOTSTRAP_ADMIN_EMAIL: ${MAIL_ADMIN_EMAIL:-admin@example.com}
       BOOTSTRAP_ADMIN_PASSWORD: ${MAIL_ADMIN_PASSWORD:-ChangeMeAdmin!123}
       BOOTSTRAP_ADMIN_ROLE: ${MAIL_ADMIN_ROLE:-admin}
+
+      # 로컬 파일 기반 사용자 동기화 출력 경로
       DB_PATH: /app/data/mailadmin.db
       DOVECOT_USERS_FILE: /app/generated/dovecot/users.passwd
       POSTFIX_MAILBOX_MAPS_FILE: /app/generated/postfix/virtual_mailbox_maps
       POSTFIX_DOMAINS_FILE: /app/generated/postfix/virtual_mailbox_domains
+
+      # 메일 저장 루트 및 소유 UID/GID
       MAIL_ROOT: /var/mail/vhosts
       MAIL_UID: 5000
       MAIL_GID: 5000
     volumes:
+      # 데이터/생성 파일은 호스트 바인드 마운트
       - ./data:/app/data
       - ./generated:/app/generated
+      # 실제 메일 데이터는 named volume으로 공유
       - vmail:/var/mail/vhosts
     ports:
       - "8080:8080"
       - "${APP_POP3_PORT:-2111}:110"
 
+  # 메일 아카이브 저장용 PostgreSQL
   archive-db:
     image: postgres:16
     container_name: archive-db
     environment:
+      # 기본값은 로컬 개발용, 운영에서는 .env/secret 사용 권장
       POSTGRES_USER: ${ARCHIVE_DB_USER:-mail}
       POSTGRES_PASSWORD: ${ARCHIVE_DB_PASSWORD:-mailpw}
       POSTGRES_DB: ${ARCHIVE_DB_NAME:-mailarchive}
     volumes:
       - archive_db_data:/var/lib/postgresql/data
 
+  # SMTP 서버(Postfix): 수신/제출(25/587) 및 Dovecot LMTP 전달
   postfix:
     build:
       context: .
       dockerfile: deploy/docker/postfix/Dockerfile
     container_name: postfix
     depends_on:
+      # 인증/전달/필터링 구성요소 선기동
       - dovecot
       - rspamd
       - mail-admin
@@ -81,25 +113,33 @@ services:
       MAIL_DOMAIN: ${MAIL_DOMAIN:-example.com}
       MAIL_HOSTNAME: ${MAIL_HOSTNAME:-mail.example.com}
     volumes:
+      # mail-admin이 생성한 virtual map 파일 참조
       - ./generated/postfix:/etc/postfix/generated
+      # Postfix 주요 설정은 읽기 전용 마운트
       - ./deploy/docker/postfix/main.cf:/etc/postfix/main.cf:ro
       - ./deploy/docker/postfix/master.cf:/etc/postfix/master.cf:ro
+      # 메일 데이터/스풀 공유
       - vmail:/var/mail/vhosts
       - postfix_spool:/var/spool/postfix
     ports:
       - "2525:25"
       - "2587:587"
 
+  # IMAP/POP3/LMTP 서버(Dovecot): 인증 및 메일박스 접근 제공
   dovecot:
     build:
       context: .
       dockerfile: deploy/docker/dovecot/Dockerfile
     container_name: dovecot
     depends_on:
+      # 사용자 동기화 파일 생성 주체인 mail-admin 선기동
       - mail-admin
     volumes:
+      # mail-admin generated 사용자 파일을 인증 소스로 사용
       - ./generated/dovecot:/etc/dovecot/generated
+      # dovecot.conf는 고정 설정 파일 사용
       - ./deploy/docker/dovecot/dovecot.conf:/etc/dovecot/dovecot.conf:ro
+      # 메일 데이터/포스트픽스 소켓 디렉터리 공유
       - vmail:/var/mail/vhosts
       - postfix_spool:/var/spool/postfix
     ports:
@@ -108,10 +148,12 @@ services:
       - "2110:110"
       - "2995:995"
 
+  # 메일 정책 엔진(Rspamd): 스팸/바이러스 정책 및 milter 제공
   rspamd:
     image: rspamd/rspamd:latest
     container_name: rspamd
     depends_on:
+      # 바이러스 검사 백엔드
       - clamav
     volumes:
       - ./deploy/docker/rspamd/local.d:/etc/rspamd/local.d:ro
@@ -119,22 +161,26 @@ services:
       - "11334:11334"
       - "11332:11332"
 
+  # 바이러스 스캐너(ClamAV)
   clamav:
     image: clamav/clamav:latest
     container_name: clamav
     ports:
       - "3310:3310"
 
+  # 테스트용 mock ICAP 서버(v3 보안 체인 검증 시 선택 실행)
   mock-icap:
     build:
       context: .
       dockerfile: deploy/docker/mock-icap/Dockerfile
     container_name: mock-icap
     profiles:
+      # 기본 compose up에는 포함되지 않고, --profile v3mock에서만 실행
       - v3mock
     ports:
       - "1344:1344"
 
+  # 테스트용 웹메일 UI(Roundcube)
   roundcube:
     image: roundcube/roundcubemail:latest
     container_name: roundcube
@@ -142,6 +188,7 @@ services:
       - dovecot
       - postfix
     environment:
+      # IMAP/SMTP 백엔드 연결 정보
       ROUNDCUBEMAIL_DEFAULT_HOST: tls://dovecot:993
       ROUNDCUBEMAIL_SMTP_SERVER: tls://postfix:587
       ROUNDCUBEMAIL_SMTP_USER: "%u"
@@ -150,6 +197,9 @@ services:
       - "8081:80"
 
 volumes:
+  # 사용자 메일 저장소(volume shared by postfix/dovecot/mail-admin)
   vmail:
+  # Postfix 런타임 스풀/소켓 저장소
   postfix_spool:
+  # PostgreSQL 데이터 영속 볼륨
   archive_db_data:

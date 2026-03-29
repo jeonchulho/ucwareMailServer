@@ -1,11 +1,13 @@
 [Unit]
 Description=ucware Mail Admin API
 Documentation=https://github.com/jeonchulho/ucwareMailServer
+# 네트워크 기동 이후 서비스 시작
 After=network.target
 Wants=network.target
 
 [Service]
 Type=simple
+# 전용 비루트 계정으로 실행
 User=mailadmin
 Group=mailadmin
 WorkingDirectory=/opt/mail-admin
@@ -13,9 +15,12 @@ WorkingDirectory=/opt/mail-admin
 # 환경 변수 파일 (chmod 600 권장)
 EnvironmentFile=/etc/mail-admin/env
 
+# 메인 실행 파일
 ExecStart=/opt/mail-admin/mail-admin
+# 설정 재적용용 HUP 시그널
 ExecReload=/bin/kill -HUP $MAINPID
 
+# 실패 시 자동 재시작
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
@@ -26,11 +31,17 @@ StandardError=journal
 SyslogIdentifier=mail-admin
 
 # 보안 강화
+# 권한 상승 차단
 NoNewPrivileges=yes
+# 서비스 전용 임시 디렉터리
 PrivateTmp=yes
+# 시스템 경로 읽기 전용 보호
 ProtectSystem=strict
+# 사용자 홈 접근 차단
 ProtectHome=yes
+# 애플리케이션 데이터/생성 파일 경로만 쓰기 허용
 ReadWritePaths=/opt/mail-admin/data /opt/mail-admin/generated
+# Linux capability 제거
 CapabilityBoundingSet=
 
 [Install]

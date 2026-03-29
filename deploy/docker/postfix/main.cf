@@ -1,16 +1,20 @@
+# Postfix 버전 호환 동작 레벨
 compatibility_level = 2
 
+# 기본 메일 식별자/네트워크 설정
 myhostname = ${MAIL_HOSTNAME}
 mydomain = ${MAIL_DOMAIN}
 myorigin = $mydomain
 inet_interfaces = all
 inet_protocols = ipv4
 
+# SMTP 배너 및 기본 동작
 smtpd_banner = $myhostname ESMTP
 append_dot_mydomain = no
 biff = no
 readme_directory = no
 
+# 릴레이 제어: 내부망/인증 사용자만 허용, 그 외는 목적지 정책 검사
 mynetworks = 127.0.0.0/8 [::1]/128
 smtpd_helo_required = yes
 smtpd_recipient_restrictions =
@@ -18,20 +22,23 @@ smtpd_recipient_restrictions =
     permit_sasl_authenticated,
     reject_unauth_destination
 
+# 가상 메일박스 매핑(파일은 mail-admin이 생성)
 virtual_mailbox_domains = hash:/etc/postfix/generated/virtual_mailbox_domains
 virtual_mailbox_maps = hash:/etc/postfix/generated/virtual_mailbox_maps
+# 로컬 전달은 Dovecot LMTP 소켓으로 위임
 virtual_transport = lmtp:unix:private/dovecot-lmtp
 
+# SASL 인증을 Dovecot auth 소켓으로 위임
 smtpd_sasl_auth_enable = yes
 smtpd_sasl_type = dovecot
 smtpd_sasl_path = private/auth
 smtpd_sasl_security_options = noanonymous
 
-# Rspamd milter (Rspamd에서 스팸/바이러스 정책 평가)
+# Rspamd milter 연동: 수신 메일을 정책 엔진으로 전달해 스팸/바이러스 판정
 milter_protocol = 6
 milter_default_action = accept
 smtpd_milters = inet:rspamd:11332
 non_smtpd_milters = inet:rspamd:11332
 
-# Local dev only. In production use real TLS certs and stronger policy.
+# 로컬 개발 기본값. 운영에서는 실제 인증서와 stricter TLS 정책 사용 권장.
 smtpd_tls_security_level = may

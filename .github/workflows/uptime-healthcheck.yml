@@ -1,8 +1,10 @@
 name: Uptime Healthcheck
 
 on:
+  # 10분 간격 주기 점검
   schedule:
     - cron: '*/10 * * * *'
+  # 수동 실행도 허용(일회성 URL 오버라이드 가능)
   workflow_dispatch:
     inputs:
       override_url:
@@ -11,46 +13,58 @@ on:
         type: string
 
 permissions:
+  # 저장소 읽기 권한만 사용(최소 권한)
   contents: read
 
 jobs:
   healthcheck:
     name: Scheduled Health Check
     runs-on: ubuntu-latest
+    # 네트워크 지연/무한 대기 방지용 전체 타임아웃
     timeout-minutes: 5
     steps:
       - name: Resolve target URL
         id: target
         env:
+          # 기본 점검 URL은 Secret에서 읽음
           CHECK_URL_SECRET: ${{ secrets.UPTIME_CHECK_URL }}
+          # 수동 실행 입력값(있으면 우선 적용)
           INPUT_URL: ${{ github.event.inputs.override_url }}
         run: |
           set -euo pipefail
           URL="$CHECK_URL_SECRET"
+          # override_url 입력이 있으면 해당 URL로 덮어씀
           if [[ -n "${INPUT_URL:-}" ]]; then
             URL="$INPUT_URL"
           fi
+          # 최종 URL이 비어 있으면 즉시 실패
           if [[ -z "$URL" ]]; then
             echo "UPTIME_CHECK_URL secret is not configured." >&2
             exit 1
           fi
+          # 다음 스텝에서 참조하도록 출력 변수 저장
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
       - name: Run HTTP health check
         id: probe
         env:
           URL: ${{ steps.target.outputs.url }}
+          # 예상 상태코드(미지정 시 200)
           EXPECTED_STATUS: ${{ vars.UPTIME_EXPECTED_STATUS }}
+          # 선택: 응답 본문 포함 문자열 검증
           EXPECTED_BODY_SUBSTRING: ${{ vars.UPTIME_EXPECTED_BODY_SUBSTRING }}
         run: |
           set -euo pipefail
           : "${EXPECTED_STATUS:=200}"
+          # 실패 분석용 임시 파일
           tmp_body="$(mktemp)"
           tmp_meta="$(mktemp)"
 
+          # redirect 허용(-L), 연결/전체 타임아웃 제한
           http_code="$(curl -sS -L --connect-timeout 5 --max-time 15 \
             -w '%{http_code}' -o "$tmp_body" "$URL" || true)"
 
+          # 네트워크 실패/응답 없음 처리
           if [[ -z "$http_code" || "$http_code" == "000" ]]; then
             echo "HTTP probe failed for $URL" >&2
             exit 1
@@ -59,11 +73,13 @@ jobs:
           echo "http_code=$http_code" >> "$GITHUB_OUTPUT"
           echo "checked_url=$URL" >> "$GITHUB_OUTPUT"
 
+          # 상태코드 검증
           if [[ "$http_code" != "$EXPECTED_STATUS" ]]; then
             echo "Unexpected status: got=$http_code expected=$EXPECTED_STATUS" >&2
             exit 1
           fi
 
+          # 본문 부분 문자열 검증(설정된 경우만)
           if [[ -n "${EXPECTED_BODY_SUBSTRING:-}" ]]; then
             if ! grep -Fq "$EXPECTED_BODY_SUBSTRING" "$tmp_body"; then
               echo "Response does not contain expected substring" >&2
@@ -77,11 +93,13 @@ jobs:
             echo "checked_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > "$tmp_meta"
 
+          # 실패 시 확인 가능한 아티팩트 파일 생성
           cp "$tmp_meta" healthcheck-meta.txt
           cp "$tmp_body" healthcheck-body.txt
 
       - name: Upload probe artifacts on failure
         if: failure()
+        # 실패 디버깅용 응답 본문/메타 업로드
         uses: actions/upload-artifact@v4
         with:
           name: healthcheck-failure-artifacts
@@ -91,6 +109,7 @@ jobs:
           retention-days: 3
 
       - name: Send failure alert webhook
+        # 알림 웹훅 URL이 설정된 경우에만 경고 전송
         if: failure() && secrets.ALERT_WEBHOOK_URL != ''
         env:
           ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
@@ -100,6 +119,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          # 단순 text payload로 실패 컨텍스트 전송
           payload=$(cat <<JSON
           {
             "text": "[ucwareMailServer] Uptime healthcheck failed\\nrepo: ${REPO}\\nurl: ${URL}\\nhttp_code: ${HTTP_CODE:-unknown}\\nrun: ${RUN_URL}"

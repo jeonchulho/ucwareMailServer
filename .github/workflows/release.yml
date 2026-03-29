@@ -1,12 +1,15 @@
 name: Release
 
 on:
+  # 시맨틱 버전 태그(vX.Y.Z) 푸시 시 릴리스 파이프라인 실행
   push:
     tags:
       - 'v*.*.*'
 
 env:
+  # 배포 이미지 저장 레지스트리
   REGISTRY: ghcr.io
+  # 배포 이미지 이름
   IMAGE_NAME: ${{ github.repository }}/mail-admin
 
 jobs:
@@ -14,12 +17,15 @@ jobs:
     name: Build & Release
     runs-on: ubuntu-latest
     permissions:
+      # GitHub Release 생성/자산 업로드 권한
       contents: write
+      # GHCR 이미지 푸시 권한
       packages: write
 
     steps:
       - uses: actions/checkout@v4
         with:
+          # 태그/히스토리 정보까지 필요하므로 전체 fetch
           fetch-depth: 0
 
       - name: Set up Go
@@ -29,18 +35,21 @@ jobs:
           cache: true
 
       - name: Build release binary (linux/amd64)
+        # 릴리스 태그 버전을 바이너리 메타에 주입
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
             go build -trimpath \
             -ldflags "-s -w -X main.Version=${{ github.ref_name }}" \
             -o dist/mail-admin-linux-amd64 \
             ./cmd/mail-admin
+          # 배포 검증용 체크섬 파일 생성
           sha256sum dist/mail-admin-linux-amd64 > dist/mail-admin-linux-amd64.sha256
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
+        # GitHub 기본 토큰으로 GHCR 로그인
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -49,6 +58,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
+        # 태그 전략: exact semver, major.minor, latest
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -58,6 +68,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build & push Docker image
+        # 릴리스 이미지 빌드/푸시
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -70,9 +81,11 @@ jobs:
           platforms: linux/amd64
 
       - name: Create GitHub Release
+        # 바이너리 + SHA256 파일을 릴리스 자산으로 첨부
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/mail-admin-linux-amd64
             dist/mail-admin-linux-amd64.sha256
+          # 커밋 기반 자동 릴리스 노트 생성
           generate_release_notes: true
