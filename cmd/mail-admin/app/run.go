@@ -37,7 +37,7 @@ func Run() {
 	if err != nil {
 		log.Fatalf("service init error: %v", err)
 	}
-	mux := buildMux(authService, handlerService)
+	mux := buildMux(authService, handlerService, cfg.StaticDir)
 
 	if cfg.LMTPEnabled {
 		if archiveStore == nil {

@@ -2,13 +2,14 @@ package app
 
 import (
 	"net/http"
+	"os"
 
 	authsvc "github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/auth"
 	handlersvc "github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/handlers"
 	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/security"
 )
 
-func buildMux(authService *authsvc.Service, handlerService *handlersvc.Service) *http.ServeMux {
+func buildMux(authService *authsvc.Service, handlerService *handlersvc.Service, staticDir string) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handlerService.HandleHealthz)
 	mux.HandleFunc("/v1/auth/login", authService.HandleLogin)
@@ -30,5 +31,12 @@ func buildMux(authService *authsvc.Service, handlerService *handlersvc.Service) 
 	mux.Handle("/v1/audits", authService.WithAuth(http.HandlerFunc(handlerService.HandleAudits), security.RoleOperator, security.RoleAdmin))
 	mux.Handle("/v1/mailboxes", authService.WithAuth(http.HandlerFunc(handlerService.HandleMailboxes), security.RoleViewer, security.RoleOperator, security.RoleAdmin))
 	mux.Handle("/v1/messages", authService.WithAuth(http.HandlerFunc(handlerService.HandleMessages), security.RoleViewer, security.RoleOperator, security.RoleAdmin))
+
+	// 프론트엔드 정적 파일 서빙 (STATIC_DIR)
+	if staticDir != "" {
+		if _, err := os.Stat(staticDir); err == nil {
+			mux.Handle("/", http.FileServer(http.Dir(staticDir)))
+		}
+	}
 	return mux
 }
