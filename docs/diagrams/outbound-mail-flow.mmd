@@ -1,0 +1,24 @@
+flowchart LR
+    A[사용자\nWeb Frontend 또는 Roundcube] --> B[mail-admin API\nPOST /v1/send]
+    B --> C{요청 형식}
+    C -->|JSON| D[본문/첨부 파싱\nBase64 디코딩]
+    C -->|multipart| E[업로드 첨부 스트리밍 수집]
+    D --> F[발송 요청 검증\n권한/레이트리밋]
+    E --> F
+
+    F --> G[SMTP Relay 연결\npostfix:587]
+    G --> H[Postfix Submission\nSMTP AUTH/TLS]
+    H --> I[Rspamd milter 정책 검사]
+    I --> J{바이러스/스팸 검사}
+    J -->|정상| K[원격 수신 MX로 전달]
+    J -->|위협 탐지| L[거부 또는 임시실패]
+
+    I --> M[ClamAV]
+    I --> N[외부 ICAP\n선택 v3]
+
+    B --> O[아카이브 저장\n선택 ARCHIVE_DB_ENABLED]
+    O --> P[(Archive DB)]
+
+    K --> Q[외부 수신자 메일 서버]
+    L --> R[발송 실패 응답/로그]
+    B --> S[API 응답\n성공 또는 오류]

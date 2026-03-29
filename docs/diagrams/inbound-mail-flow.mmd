@@ -1,0 +1,23 @@
+flowchart LR
+    A[외부 발신자 메일 서버] --> B[인터넷 DNS/MX 경로]
+    B --> C[Postfix SMTP 25 수신]
+
+    C --> D[수신 정책 검사\n수신자/릴레이 제한]
+    D --> E[Rspamd milter 검사]
+    E --> F[ClamAV 검사]
+    E --> G[외부 ICAP 검사\n선택 v3]
+
+    F --> H{판정}
+    G --> H
+    H -->|정상| I[Dovecot LMTP 전달\nprivate/dovecot-lmtp]
+    H -->|위협/정책 위반| J[거부 또는 임시실패\n5xx/4xx]
+
+    I --> K[Maildir 저장\n/var/mail/vhosts]
+    K --> L[IMAP/POP3 조회]
+    L --> M[사용자 메일 클라이언트\nRoundcube/Outlook/Thunderbird]
+
+    K --> N[보관/동기화 경로\n운영 정책에 따라]
+    N --> O[(Archive DB 또는 로그)]
+
+    C --> P[Postfix 큐/재시도\n일시 장애 시]
+    P --> C
