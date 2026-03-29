@@ -258,6 +258,25 @@ export ANTIVIRUS_V3_ICAP_SERVER=10.0.0.5:1344
 export ANTIVIRUS_V3_ICAP_SCHEME=respmod
 export ANTIVIRUS_FAIL_OPEN=yes
 sudo ./scripts/provision-production.sh example.com mail.example.com admin@example.com 203.0.113.10
+
+## 8) 백업/복구 자동화
+
+P0 운영 항목으로 백업/복구 스크립트를 제공합니다.
+
+```bash
+chmod +x scripts/backup.sh scripts/restore.sh
+./scripts/backup.sh
+```
+
+복구:
+
+```bash
+./scripts/restore.sh --backup-dir backups/<timestamp>
+```
+
+상세 절차(리허설 포함):
+
+- `BACKUP_RESTORE_RUNBOOK.md`
 ```
 
 안티바이러스 비활성화 예시:
