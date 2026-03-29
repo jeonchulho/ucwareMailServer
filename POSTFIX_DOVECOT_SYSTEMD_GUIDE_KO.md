@@ -523,6 +523,14 @@ flowchart LR
 	B --> S[API 응답\n성공 또는 오류]
 ```
 
+	PNG 이미지:
+
+	![메일 전송 Outbound 흐름도](docs/diagrams/outbound-mail-flow.png)
+
+	원본 Mermaid:
+
+	- `docs/diagrams/outbound-mail-flow.mmd`
+
 ### 9.2 외부메일 수신(Inbound) 흐름
 
 ```mermaid
@@ -550,3 +558,11 @@ flowchart LR
 	C --> P[Postfix 큐/재시도\n일시 장애 시]
 	P --> C
 ```
+
+	PNG 이미지:
+
+	![외부메일 수신 Inbound 흐름도](docs/diagrams/inbound-mail-flow.png)
+
+	원본 Mermaid:
+
+	- `docs/diagrams/inbound-mail-flow.mmd`
