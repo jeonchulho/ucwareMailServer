@@ -70,6 +70,8 @@ type SendAttachment struct {
 	ContentBase64 string `json:"contentBase64"` // Base64 인코딩된 파일 바이트
 }
 
+// SendMessageResponse 는 메일 발송 API(/send)의 최종 응답 본문입니다.
+// Archived: 아카이브 DB 저장 성공 여부, Warning: 비치명적 경고 메시지
 type SendMessageResponse struct {
 	Status          string                        `json:"status"`
 	Archived        bool                          `json:"archived"`
@@ -88,6 +90,8 @@ const (
 	sendArchiveRawMaxBytes      = int64(25 * 1024 * 1024)       // 아카이브에 저장할 원본 메시지 최대 크기: 25 MB
 )
 
+// sendFilePayload 는 첨부 파일의 메타데이터와 실제 파일 데이터를 담는 내부 전송 구조체입니다.
+// Open 은 multipart 업로드 파일용 지연 열기 함수이며, JSON 방식에서는 Data 에 디코딩된 바이트가 담깁니다.
 type sendFilePayload struct {
 	Filename    string
 	ContentType string
@@ -96,8 +100,11 @@ type sendFilePayload struct {
 	Open        func() (io.ReadCloser, error)
 }
 
+// errInvalidAutoRoute 는 resolveMailboxIDForAutoRoute 에서 유효하지 않은 방향이나 이메일인 경우의 센티넬 오류입니다.
 var errInvalidAutoRoute = errors.New("invalid auto route input")
 
+// Dependencies 는 NewService 생성자에 주입되는 외부 의존성 모음입니다.
+// 핵심 스토리지, 감사 로그 콜백, JWT 컨텍스트 추출 함수를 포함합니다.
 type Dependencies struct {
 	Store            *store.SQLiteStore
 	Archive          *archive.SQLStore
@@ -242,6 +249,8 @@ func (s *Service) HandleAudits(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
+// HandleMailboxes 는 메일박스 목록 조회(GET) 및 메일박스 생성(POST)을 처리합니다.
+// POST 는 admin/operator 역할만 허용하며, 아카이브 DB가 비활성화된 경우 501을 반환합니다.
 func (s *Service) HandleMailboxes(w http.ResponseWriter, r *http.Request) {
 	if s.archive == nil {
 		http.Error(w, "archive db is disabled", http.StatusNotImplemented)
@@ -294,6 +303,9 @@ func (s *Service) HandleMailboxes(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// HandleMessages 는 메일 메시지 목록 조회(GET) 및 메시지 수동 주입(POST)을 처리합니다.
+// GET: ?mailboxId=<id>&limit=N 으로 특정 메일박스의 메시지를 조회합니다.
+// POST: 외부 시스템에서 메시지를 직접 아카이브에 삽입할 때 사용합니다.
 func (s *Service) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	if s.archive == nil {
 		http.Error(w, "archive db is disabled", http.StatusNotImplemented)
@@ -595,6 +607,7 @@ func (s *Service) archiveOutboundCopy(ctx context.Context, req SendMessageReques
 	return nil
 }
 
+// listUsers 는 SQLite에 저장된 전체 메일 사용자 목록을 JSON으로 반환하는 내부 헬퍼입니다.
 func (s *Service) listUsers(w http.ResponseWriter, r *http.Request) {
 	users, err := s.store.ListUsers(r.Context())
 	if err != nil {
@@ -608,6 +621,9 @@ func (s *Service) listUsers(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
+// createUser 는 새 메일 사용자를 생성합니다.
+// 이메일 형식 검증 → 최소 10자 비밀번호 검증 → bcrypt 해시 → SQLite 저장 → Dovecot/Postfix 즉시 동기화
+// 모든 단계에서 실패 시 감사 로그를 기록합니다.
 func (s *Service) createUser(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	var req userstypes.CreateUserRequest
@@ -664,12 +680,16 @@ func (s *Service) syncNow(ctx context.Context) error {
 	return syncer.Export(users, syncer.ExportConfig{DovecotUsersFile: s.cfg.DovecotUsersFile, PostfixMailboxMapsFile: s.cfg.PostfixMailboxMapsFile, PostfixDomainsFile: s.cfg.PostfixDomainsFile, MailRoot: s.cfg.MailRoot, MailUID: s.cfg.MailUID, MailGID: s.cfg.MailGID})
 }
 
+// writeAudit 는 감사 로그 기록 함수를 안전하게 호출합니다.
+// writeAuditFn 이 nil 이면 아무 동작도 하지 않습니다.
 func (s *Service) writeAudit(ctx context.Context, action, actor, email, status, message string, r *http.Request) {
 	if s.writeAuditFn != nil {
 		s.writeAuditFn(ctx, action, actor, email, status, message, r)
 	}
 }
 
+// actorFromContext 는 요청 컨텍스트에서 현재 사용자(actor)의 이메일을 추출합니다.
+// actorFromCtxFn 이 설정되지 않은 경우 빈 문자열을 반환합니다.
 func (s *Service) actorFromContext(ctx context.Context) string {
 	if s.actorFromCtxFn == nil {
 		return ""
@@ -677,6 +697,7 @@ func (s *Service) actorFromContext(ctx context.Context) string {
 	return s.actorFromCtxFn(ctx)
 }
 
+// roleFromContext 는 요청 컨텍스트에서 현재 사용자의 역할(admin/operator/viewer 등)을 추출합니다.
 func (s *Service) roleFromContext(ctx context.Context) string {
 	if s.roleFromCtxFn == nil {
 		return ""
@@ -684,6 +705,8 @@ func (s *Service) roleFromContext(ctx context.Context) string {
 	return s.roleFromCtxFn(ctx)
 }
 
+// isValidEmail 은 RFC 5322 파서를 사용해 이메일 주소의 유효성을 검증합니다.
+// 파싱 성공 후 파싱된 주소와 원본 값이 일치하는지 대소문자 무시 비교를 수행합니다.
 func isValidEmail(value string) bool {
 	addr, err := mail.ParseAddress(value)
 	if err != nil {
@@ -692,6 +715,9 @@ func isValidEmail(value string) bool {
 	return strings.EqualFold(addr.Address, value)
 }
 
+// buildRawMIME 는 첨부 파일이 없는 단순 text/plain RFC 5322 메일 메시지 문자열을 조립합니다.
+// 헤더(From, To, Subject, Date, MIME-Version, Content-Type, Content-Transfer-Encoding)와
+// 본문을 CRLF 로 연결하여 반환합니다.
 func buildRawMIME(from, to, subject, body string) string {
 	date := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 +0000")
 	return strings.Join([]string{
@@ -707,6 +733,9 @@ func buildRawMIME(from, to, subject, body string) string {
 	}, "\r\n")
 }
 
+// parseSendRequest 는 Content-Type 에 따라 요청을 파싱합니다.
+// multipart/form-data 이면 폼 필드와 첨부 파일을 파싱하고,
+// 그 외(application/json 등)이면 JSON 바디를 디코딩합니다.
 func parseSendRequest(r *http.Request, req *SendMessageRequest) ([]sendFilePayload, error) {
 	ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
 	if strings.HasPrefix(ct, "multipart/form-data") {
@@ -728,6 +757,9 @@ func parseSendRequest(r *http.Request, req *SendMessageRequest) ([]sendFilePaylo
 	return nil, nil
 }
 
+// collectUploadedAttachments 는 multipart 폼의 "attachments" 필드에서 업로드된 파일을 수집합니다.
+// 첨부 개수, 단일 파일 크기, 전체 합계 크기를 상한(sendMax* 상수)과 비교하여 검증합니다.
+// 각 파일은 Open 함수(지연 열기)를 포함한 sendFilePayload 로 변환됩니다.
 func collectUploadedAttachments(form *multipart.Form) ([]sendFilePayload, error) {
 	if form == nil || form.File == nil {
 		return nil, nil
@@ -769,6 +801,8 @@ func collectUploadedAttachments(form *multipart.Form) ([]sendFilePayload, error)
 	return out, nil
 }
 
+// decodeJSONAttachments 는 JSON 요청 본문의 Base64 인코딩 첨부 목록을 디코딩합니다.
+// 개수, 단일 크기, 전체 크기 상한(sendJSONMax* 상수)을 검증 후 sendFilePayload 슬라이스로 반환합니다.
 func decodeJSONAttachments(items []SendAttachment) ([]sendFilePayload, error) {
 	if len(items) > sendMaxAttachments {
 		return nil, fmt.Errorf("attachments must be <= %d", sendMaxAttachments)
@@ -800,6 +834,8 @@ func decodeJSONAttachments(items []SendAttachment) ([]sendFilePayload, error) {
 	return out, nil
 }
 
+// buildMultipartMIME 는 multipart/mixed MIME 메일을 메모리 버퍼에 조립하여 문자열로 반환합니다.
+// 아카이브 저장이나 디버그 목적 등 전체 MIME 문자열이 필요할 때 사용합니다.
 func buildMultipartMIME(from, to, subject, body string, files []sendFilePayload) (string, error) {
 	var raw bytes.Buffer
 	if err := writeMultipartMIME(&raw, from, to, subject, body, files); err != nil {
@@ -808,6 +844,9 @@ func buildMultipartMIME(from, to, subject, body string, files []sendFilePayload)
 	return raw.String(), nil
 }
 
+// sendMultipartSMTP 는 SMTP 릴레이 서버에 직접 연결하여 multipart/mixed 메일을 스트리밍으로 발송합니다.
+// 설정에 SMTPUsername 이 지정된 경우 PLAIN 인증을 수행하며,
+// 대용량 첨부 파일 처리 시 메모리를 절약하기 위해 스트리밍 방식을 사용합니다.
 func (s *Service) sendMultipartSMTP(from, to, subject, body string, files []sendFilePayload) error {
 	client, err := smtp.Dial(s.cfg.SMTPRelayAddr)
 	if err != nil {
@@ -845,6 +884,9 @@ func (s *Service) sendMultipartSMTP(from, to, subject, body string, files []send
 	return client.Quit()
 }
 
+// writeMultipartMIME 는 RFC 5322 + MIME multipart/mixed 형식의 메일을 w(io.Writer)에 스트리밍으로 기록합니다.
+// 헤더 작성 → text/plain 파트 → 각 첨부 파트(Base64, 76자 CRLF 줄바꿈) 순서로 기록합니다.
+// 단일 첨부 크기와 전체 합계 크기가 sendMax* 상수를 초과하면 오류를 반환합니다.
 func writeMultipartMIME(w io.Writer, from, to, subject, body string, files []sendFilePayload) error {
 	mw := multipart.NewWriter(w)
 	date := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 +0000")
@@ -921,6 +963,9 @@ func writeMultipartMIME(w io.Writer, from, to, subject, body string, files []sen
 	return nil
 }
 
+// openSendFilePayload 는 sendFilePayload 에서 실제 파일 데이터를 읽을 수 있는 ReadCloser 를 반환합니다.
+// Open 함수가 설정된 경우(multipart 업로드)에는 해당 함수를 호출하고,
+// 그렇지 않으면(JSON Base64 디코딩된 데이터) 바이트 슬라이스에서 읽기를 생성합니다.
 func openSendFilePayload(f sendFilePayload) (io.ReadCloser, error) {
 	if f.Open != nil {
 		return f.Open()
@@ -928,6 +973,8 @@ func openSendFilePayload(f sendFilePayload) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(f.Data)), nil
 }
 
+// smtpHostFromAddr 는 "host:port" 형식의 SMTP 주소에서 호스트 부분만 추출합니다.
+// net.SplitHostPort 실패 시 콜론 앞부분을 단순 분리하며, SMTP PlainAuth 에서 인증 서버 이름으로 사용됩니다.
 func smtpHostFromAddr(addr string) string {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
 	if err == nil && host != "" {
@@ -939,6 +986,8 @@ func smtpHostFromAddr(addr string) string {
 	return strings.TrimSpace(addr)
 }
 
+// requestClientIP 는 HTTP 요청에서 클라이언트의 실제 IP 주소를 추출합니다.
+// 우선순위: X-Forwarded-For 첫 번째 항목 → X-Real-IP → RemoteAddr (리버스 프록시 환경 고려)
 func requestClientIP(r *http.Request) string {
 	xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
 	if xff != "" {
@@ -958,6 +1007,7 @@ func requestClientIP(r *http.Request) string {
 	return strings.TrimSpace(r.RemoteAddr)
 }
 
+// validateFileCount 는 첨부 파일 개수가 sendMaxAttachments 상한을 초과하는지만 검증합니다.
 func validateFileCount(files []sendFilePayload) error {
 	if len(files) > sendMaxAttachments {
 		return fmt.Errorf("attachments must be <= %d", sendMaxAttachments)
@@ -965,6 +1015,8 @@ func validateFileCount(files []sendFilePayload) error {
 	return nil
 }
 
+// totalAttachmentBytes 는 모든 첨부 파일의 총 바이트 수를 계산합니다.
+// SizeBytes 가 0 이상인 경우 해당 값을 사용하고, 0이면 실제 Data 슬라이스 길이로 계산합니다.
 func totalAttachmentBytes(files []sendFilePayload) int64 {
 	var total int64
 	for _, f := range files {
@@ -977,6 +1029,9 @@ func totalAttachmentBytes(files []sendFilePayload) int64 {
 	return total
 }
 
+// attachmentMetaFromFiles 는 sendFilePayload 슬라이스를 AttachmentMeta 슬라이스로 변환합니다.
+// 빈 파일명은 건너뛰고, Content-Type 파싱에 실패하면 application/octet-stream 으로 대체합니다.
+// 발송 API 응답 본문의 첨부 메타 목록 구성에 사용됩니다.
 func attachmentMetaFromFiles(files []sendFilePayload) []archivetypes.AttachmentMeta {
 	out := make([]archivetypes.AttachmentMeta, 0, len(files))
 	for _, f := range files {
@@ -996,6 +1051,9 @@ func attachmentMetaFromFiles(files []sendFilePayload) []archivetypes.AttachmentM
 	return out
 }
 
+// extractAttachmentMeta 는 완성된 raw MIME 메시지 문자열에서 첨부 파일 메타데이터를 추출합니다.
+// mail.ReadMessage 로 헤더를 파싱하고, multipart Content-Type 의 boundary 를 찾아
+// walkMultipartParts 로 재귀적으로 파트를 순회합니다.
 func extractAttachmentMeta(raw string) []archivetypes.AttachmentMeta {
 	msg, err := mail.ReadMessage(strings.NewReader(raw))
 	if err != nil {
@@ -1018,6 +1076,9 @@ func extractAttachmentMeta(raw string) []archivetypes.AttachmentMeta {
 	return out
 }
 
+// walkMultipartParts 는 multipart.Reader 를 재귀적으로 순회하며 첨부 파트의 메타데이터를 수집합니다.
+// 중첩 multipart(multipart/* Content-Type) 는 재귀적으로 처리합니다.
+// Content-Disposition: attachment 이거나 filename 이 있는 파트를 첨부로 간주합니다.
 func walkMultipartParts(mr *multipart.Reader, out *[]archivetypes.AttachmentMeta) {
 	for {
 		part, err := mr.NextPart()
@@ -1059,6 +1120,8 @@ func walkMultipartParts(mr *multipart.Reader, out *[]archivetypes.AttachmentMeta
 	}
 }
 
+// base64LineWriter 는 RFC 2045 에 따라 Base64 인코딩된 데이터를 76자마다 CRLF 를 삽입하여
+// 출력 writer 에 기록하는 io.Writer 래퍼입니다.
 type base64LineWriter struct {
 	w io.Writer
 	n int
@@ -1084,6 +1147,8 @@ func (bw *base64LineWriter) Write(p []byte) (int, error) {
 	return written, nil
 }
 
+// EnsureInitialSync 는 애플리케이션 시작 시 최초 1회 Dovecot/Postfix 설정 파일을 동기화합니다.
+// 동기화 실패 시 wrapping 된 오류를 반환하며, 서버 시작을 중단시킬 수 있습니다.
 func (s *Service) EnsureInitialSync(ctx context.Context) error {
 	if err := s.syncNow(ctx); err != nil {
 		return fmt.Errorf("initial sync error: %w", err)
@@ -1091,6 +1156,10 @@ func (s *Service) EnsureInitialSync(ctx context.Context) error {
 	return nil
 }
 
+// resolveMailboxIDForAutoRoute 는 메일 방향(inbound/outbound)에 따라 아카이브할 메일박스 ID 를 자동으로 결정합니다.
+// inbound: toAddr(수신자)의 설정된 인바운드 메일박스를 조회
+// outbound: fromAddr(발신자)의 설정된 아웃바운드 메일박스를 조회
+// 일치하는 메일박스를 찾지 못하면 errInvalidAutoRoute 를 감싼 오류를 반환합니다.
 func (s *Service) resolveMailboxIDForAutoRoute(ctx context.Context, direction, fromAddr, toAddr string) (string, error) {
 	var userEmail string
 	var mailboxName string
