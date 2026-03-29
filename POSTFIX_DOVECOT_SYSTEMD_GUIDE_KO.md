@@ -487,3 +487,66 @@ Rspamd는 고성능 메일 필터링 엔진입니다.
 8. ICAP 관련 환경변수(`ANTIVIRUS_PROVIDER`, `ANTIVIRUS_FAIL_OPEN`) 정책 일관성
 9. systemd `ReadWritePaths`에 실제 쓰기 경로 포함 여부
 10. 장애 시 로그 상관분석 체계(Postfix/Dovecot/Rspamd/App) 준비 여부
+
+---
+
+## 9) 메일 흐름 구성도
+
+아래 다이어그램은 이 저장소의 기본 Docker Compose 구성과 보안 체인을 기준으로 작성했습니다.
+
+### 9.1 메일 전송(Outbound) 흐름
+
+```mermaid
+flowchart LR
+	A[사용자\nWeb Frontend 또는 Roundcube] --> B[mail-admin API\nPOST /v1/send]
+	B --> C{요청 형식}
+	C -->|JSON| D[본문/첨부 파싱\nBase64 디코딩]
+	C -->|multipart| E[업로드 첨부 스트리밍 수집]
+	D --> F[발송 요청 검증\n권한/레이트리밋]
+	E --> F
+
+	F --> G[SMTP Relay 연결\npostfix:587]
+	G --> H[Postfix Submission\nSMTP AUTH/TLS]
+	H --> I[Rspamd milter 정책 검사]
+	I --> J{바이러스/스팸 검사}
+	J -->|정상| K[원격 수신 MX로 전달]
+	J -->|위협 탐지| L[거부 또는 임시실패]
+
+	I --> M[ClamAV]
+	I --> N[외부 ICAP\n선택(v3)]
+
+	B --> O[아카이브 저장\n선택(ARCHIVE_DB_ENABLED)]
+	O --> P[(Archive DB)]
+
+	K --> Q[외부 수신자 메일 서버]
+	L --> R[발송 실패 응답/로그]
+	B --> S[API 응답\n성공 또는 오류]
+```
+
+### 9.2 외부메일 수신(Inbound) 흐름
+
+```mermaid
+flowchart LR
+	A[외부 발신자 메일 서버] --> B[인터넷 DNS/MX 경로]
+	B --> C[Postfix SMTP 25 수신]
+
+	C --> D[수신 정책 검사\n수신자/릴레이 제한]
+	D --> E[Rspamd milter 검사]
+	E --> F[ClamAV 검사]
+	E --> G[외부 ICAP 검사\n선택(v3)]
+
+	F --> H{판정}
+	G --> H
+	H -->|정상| I[Dovecot LMTP 전달\nprivate/dovecot-lmtp]
+	H -->|위협/정책 위반| J[거부 또는 임시실패\n5xx/4xx]
+
+	I --> K[Maildir 저장\n/var/mail/vhosts]
+	K --> L[IMAP/POP3 조회]
+	L --> M[사용자 메일 클라이언트\nRoundcube/Outlook/Thunderbird]
+
+	K --> N[보관/동기화 경로\n운영 정책에 따라]
+	N --> O[(Archive DB 또는 로그)]
+
+	C --> P[Postfix 큐/재시도\n일시 장애 시]
+	P --> C
+```
