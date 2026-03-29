@@ -37,11 +37,29 @@ docker compose up -d --build
 접속 포트:
 
 - mail-admin SSR 웹 + API: `http://localhost:8080`
+- 분리 웹 프런트엔드(gin, 선택): `http://localhost:8082`
 - Roundcube: `http://localhost:8081`
 - SMTP: `localhost:2525`
 - Submission: `localhost:2587`
 - IMAP: `localhost:2143`
 - IMAPS: `localhost:2993`
+
+## 1-1) 분리 웹 서버 사용 (선택)
+
+기존 `mail-admin` 내장 SSR 대신 별도 Go 웹 서버(`gin`)를 사용할 수 있습니다.
+
+```bash
+docker compose up -d --build web-frontend mail-admin archive-db
+```
+
+접속:
+
+- `http://localhost:8082/login`
+
+특징:
+
+- 웹 서버 프로세스가 `mail-admin` API와 분리되어 독립 배포 가능
+- 웹 서버는 `API_BASE_URL`을 통해 `mail-admin`의 `/v1` API를 호출
 
 ## 1) SSR 웹 UI 사용 (권장)
 

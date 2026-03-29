@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UCware Mail</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<div id="app-screen" style="display:flex;flex-direction:column;height:100vh;">
+  <header id="header">
+    <div class="logo">UCware <em>Mail</em></div>
+    <div id="search-wrap">
+      <form method="GET" action="/mail/{{.ActiveFolder}}" style="display:contents">
+        <span class="ic">🔍</span>
+        <input name="q" type="text" placeholder="메일 검색" value="{{.Query}}" onchange="this.form.submit()">
+      </form>
+    </div>
+    <div id="header-right">
+      <a href="/mail/{{.ActiveFolder}}" class="icon-btn" title="새로고침">↻</a>
+      <form method="POST" action="/logout" style="display:inline">
+        <button type="submit" id="user-avatar" title="{{.User.Email}} ({{.User.Role}}) — 로그아웃">
+          {{initial .User.Email}}
+        </button>
+      </form>
+    </div>
+  </header>
+
+  <div id="body-row" style="flex:1;overflow:hidden;display:flex;">
+    <nav id="sidebar">
+      <button class="compose-btn" onclick="openCompose()" type="button">
+        <span class="ic">✏️</span>
+        <span>편지쓰기</span>
+      </button>
+
+      <div id="nav-list">
+        {{range .Folders}}
+        <div class="nav-item{{if eq $.ActiveFolder .Key}} active{{end}}">
+          <a href="/mail/{{.Key}}" style="display:contents;text-decoration:none;color:inherit;">
+            <span class="ic">{{.Icon}}</span>
+            <span class="label">{{.Label}}</span>
+          </a>
+        </div>
+        {{end}}
+
+        {{if .ExtraMailboxes}}
+        <div class="nav-divider"></div>
+        <div class="nav-section-label">레이블</div>
+        {{range .ExtraMailboxes}}
+        <div class="nav-item{{if eq $.ActiveFolder .Name}} active{{end}}">
+          <a href="/mail/{{.Name}}" style="display:contents;text-decoration:none;color:inherit;">
+            <span class="ic">🏷️</span>
+            <span class="label">{{.Name}}</span>
+          </a>
+        </div>
+        {{end}}
+        {{end}}
+      </div>
+    </nav>
+
+    <div id="main-pane">
+      {{if .Flash}}
+      <div class="toast show" style="position:relative;margin:8px 16px;">{{.Flash}}</div>
+      {{end}}
+
+      {{if .Error}}
+      <div class="err" style="margin:16px;">{{.Error}}</div>
+      {{end}}
+
+      {{if .ActiveMessage}}
+      <div id="message-detail" class="visible">
+        <div class="detail-toolbar">
+          <a href="/mail/{{.ActiveFolder}}" class="back-btn">← 뒤로</a>
+        </div>
+        <div class="detail-body">
+          <div class="detail-subject">{{if .ActiveMessage.Subject}}{{.ActiveMessage.Subject}}{{else}}(제목 없음){{end}}</div>
+          <div class="detail-meta">
+            <div class="detail-from-wrap">
+              <div class="detail-avatar">{{initial .ActiveMessage.FromAddr}}</div>
+              <div class="detail-from-info">
+                <div class="from-name">{{shortAddr .ActiveMessage.FromAddr}}</div>
+                <div class="from-addr">받는 사람: {{.ActiveMessage.ToAddr}}</div>
+              </div>
+            </div>
+            <div class="detail-date">{{formatDateFull .ActiveMessage.ReceivedAt}}</div>
+          </div>
+          <div class="detail-text">{{.ActiveMessage.TextBody}}</div>
+        </div>
+      </div>
+      {{else}}
+      <div id="list-toolbar">
+        <div id="folder-title">{{.ActiveFolder}}</div>
+      </div>
+      <div id="message-list">
+        {{if .Messages}}
+          {{range .Messages}}
+          <div class="msg-item{{if eq .Direction "outbound"}} read{{end}}">
+            <span class="msg-star empty">☆</span>
+            <span class="msg-from">{{shortAddr .FromAddr}}</span>
+            <a href="/mail/{{$.ActiveFolder}}/{{.ID}}" style="display:contents;text-decoration:none;color:inherit;">
+              <span class="msg-body">
+                <span class="msg-subject">{{if .Subject}}{{.Subject}}{{else}}(제목 없음){{end}}</span>
+                <span class="msg-preview">{{preview .TextBody}}</span>
+              </span>
+              <span class="msg-date">{{formatDate .ReceivedAt}}</span>
+            </a>
+          </div>
+          {{end}}
+        {{else}}
+          <div class="msg-empty">이 폴더에 메일이 없습니다.</div>
+        {{end}}
+      </div>
+      {{end}}
+    </div>
+  </div>
+</div>
+
+<div id="compose-window">
+  <div class="compose-header">
+    <span>새 메일</span>
+    <span class="ic" onclick="closeCompose()" style="cursor:pointer;" title="닫기">✕</span>
+  </div>
+  <form method="POST" action="/compose" id="compose-form">
+    <div class="compose-fields">
+      <div class="compose-field">
+        <label>받는 사람</label>
+        <input id="compose-to" name="to" type="email" placeholder="받는 사람 이메일" required>
+      </div>
+      <div class="compose-field">
+        <label>제목</label>
+        <input id="compose-subj" name="subject" type="text" placeholder="제목">
+      </div>
+    </div>
+    <div class="compose-body-field">
+      <textarea id="compose-body" name="body" placeholder="메일 내용을 입력하세요..."></textarea>
+    </div>
+    <div class="compose-footer">
+      <button class="send-btn" type="submit">보내기</button>
+    </div>
+  </form>
+</div>
+
+<div id="toast-container"></div>
+
+<script>
+function openCompose() {
+  document.getElementById('compose-window').classList.add('visible');
+  document.getElementById('compose-to').focus();
+}
+function closeCompose() {
+  document.getElementById('compose-window').classList.remove('visible');
+}
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeCompose();
+});
+</script>
+
+</body>
+</html>

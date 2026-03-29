@@ -1,4 +1,18 @@
 services:
+  web-frontend:
+    build:
+      context: .
+      dockerfile: deploy/docker/web-frontend/Dockerfile
+    container_name: web-frontend
+    depends_on:
+      - mail-admin
+    environment:
+      WEB_ADDR: :8090
+      API_BASE_URL: http://mail-admin:8080
+      WEB_SECURE_COOKIE: "false"
+    ports:
+      - "8082:8090"
+
   mail-admin:
     build:
       context: .
