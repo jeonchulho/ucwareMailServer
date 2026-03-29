@@ -1,0 +1,111 @@
+name: Uptime Healthcheck
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      override_url:
+        description: Optional URL override for one-off healthcheck
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  healthcheck:
+    name: Scheduled Health Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Resolve target URL
+        id: target
+        env:
+          CHECK_URL_SECRET: ${{ secrets.UPTIME_CHECK_URL }}
+          INPUT_URL: ${{ github.event.inputs.override_url }}
+        run: |
+          set -euo pipefail
+          URL="$CHECK_URL_SECRET"
+          if [[ -n "${INPUT_URL:-}" ]]; then
+            URL="$INPUT_URL"
+          fi
+          if [[ -z "$URL" ]]; then
+            echo "UPTIME_CHECK_URL secret is not configured." >&2
+            exit 1
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Run HTTP health check
+        id: probe
+        env:
+          URL: ${{ steps.target.outputs.url }}
+          EXPECTED_STATUS: ${{ vars.UPTIME_EXPECTED_STATUS }}
+          EXPECTED_BODY_SUBSTRING: ${{ vars.UPTIME_EXPECTED_BODY_SUBSTRING }}
+        run: |
+          set -euo pipefail
+          : "${EXPECTED_STATUS:=200}"
+          tmp_body="$(mktemp)"
+          tmp_meta="$(mktemp)"
+
+          http_code="$(curl -sS -L --connect-timeout 5 --max-time 15 \
+            -w '%{http_code}' -o "$tmp_body" "$URL" || true)"
+
+          if [[ -z "$http_code" || "$http_code" == "000" ]]; then
+            echo "HTTP probe failed for $URL" >&2
+            exit 1
+          fi
+
+          echo "http_code=$http_code" >> "$GITHUB_OUTPUT"
+          echo "checked_url=$URL" >> "$GITHUB_OUTPUT"
+
+          if [[ "$http_code" != "$EXPECTED_STATUS" ]]; then
+            echo "Unexpected status: got=$http_code expected=$EXPECTED_STATUS" >&2
+            exit 1
+          fi
+
+          if [[ -n "${EXPECTED_BODY_SUBSTRING:-}" ]]; then
+            if ! grep -Fq "$EXPECTED_BODY_SUBSTRING" "$tmp_body"; then
+              echo "Response does not contain expected substring" >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "url=$URL"
+            echo "http_code=$http_code"
+            echo "checked_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$tmp_meta"
+
+          cp "$tmp_meta" healthcheck-meta.txt
+          cp "$tmp_body" healthcheck-body.txt
+
+      - name: Upload probe artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: healthcheck-failure-artifacts
+          path: |
+            healthcheck-meta.txt
+            healthcheck-body.txt
+          retention-days: 3
+
+      - name: Send failure alert webhook
+        if: failure() && secrets.ALERT_WEBHOOK_URL != ''
+        env:
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+          URL: ${{ steps.target.outputs.url }}
+          HTTP_CODE: ${{ steps.probe.outputs.http_code }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          payload=$(cat <<JSON
+          {
+            "text": "[ucwareMailServer] Uptime healthcheck failed\\nrepo: ${REPO}\\nurl: ${URL}\\nhttp_code: ${HTTP_CODE:-unknown}\\nrun: ${RUN_URL}"
+          }
+JSON
+)
+          curl -sS -X POST "$ALERT_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$payload" >/dev/null

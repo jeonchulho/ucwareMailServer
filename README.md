@@ -277,6 +277,30 @@ chmod +x scripts/backup.sh scripts/restore.sh
 상세 절차(리허설 포함):
 
 - `BACKUP_RESTORE_RUNBOOK.md`
+
+## 9) 스케줄 헬스체크/알림 (GitHub Actions)
+
+운영 URL 감시를 위해 10분 주기 헬스체크 워크플로우를 제공합니다.
+
+- 워크플로우: `.github/workflows/uptime-healthcheck.yml`
+
+필수 GitHub Secret:
+
+- `UPTIME_CHECK_URL`: 예) `https://mail-admin.example.com/healthz`
+
+선택 GitHub Secret:
+
+- `ALERT_WEBHOOK_URL`: 실패 시 알림 전송(Webhook endpoint)
+
+선택 GitHub Variables:
+
+- `UPTIME_EXPECTED_STATUS` (기본: `200`)
+- `UPTIME_EXPECTED_BODY_SUBSTRING` (응답 본문 검증 필요 시)
+
+수동 실행:
+
+1. GitHub Actions에서 `Uptime Healthcheck` 선택
+2. 필요하면 `override_url` 입력 후 실행
 ```
 
 안티바이러스 비활성화 예시:
