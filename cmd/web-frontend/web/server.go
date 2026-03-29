@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"io"
 	"io/fs"
+	"mime/multipart"
 	"net/http"
 	"net/mail"
 	"net/url"
@@ -61,17 +62,24 @@ type mailbox struct {
 }
 
 type message struct {
-	ID         string    `json:"id"`
-	MailboxID  string    `json:"mailboxId"`
-	Direction  string    `json:"direction"`
-	FromAddr   string    `json:"fromAddr"`
-	ToAddr     string    `json:"toAddr"`
-	Subject    string    `json:"subject"`
-	RawMIME    string    `json:"rawMime"`
-	TextBody   string    `json:"textBody"`
-	SizeBytes  int64     `json:"sizeBytes"`
-	ReceivedAt time.Time `json:"receivedAt"`
-	CreatedAt  time.Time `json:"createdAt"`
+	ID          string           `json:"id"`
+	MailboxID   string           `json:"mailboxId"`
+	Direction   string           `json:"direction"`
+	FromAddr    string           `json:"fromAddr"`
+	ToAddr      string           `json:"toAddr"`
+	Subject     string           `json:"subject"`
+	RawMIME     string           `json:"rawMime"`
+	TextBody    string           `json:"textBody"`
+	SizeBytes   int64            `json:"sizeBytes"`
+	Attachments []attachmentMeta `json:"attachments,omitempty"`
+	ReceivedAt  time.Time        `json:"receivedAt"`
+	CreatedAt   time.Time        `json:"createdAt"`
+}
+
+type attachmentMeta struct {
+	Filename    string `json:"filename"`
+	ContentType string `json:"contentType"`
+	SizeBytes   int64  `json:"sizeBytes"`
 }
 
 type mailPageData struct {
@@ -335,16 +343,7 @@ func (s *Server) handleCompose(c *gin.Context) {
 		sentID = mb.ID
 	}
 
-	raw := buildRawMIME(email, to, subject, body)
-	err := s.apiJSON(c, http.MethodPost, "/v1/messages", gin.H{
-		"mailboxId": sentID,
-		"direction": "outbound",
-		"fromAddr":  email,
-		"toAddr":    to,
-		"subject":   subject,
-		"textBody":  body,
-		"rawMime":   raw,
-	}, nil, true)
+	err := s.apiSendMultipart(c, email, to, subject, body, sentID)
 	if err != nil {
 		c.Redirect(http.StatusSeeOther, "/mail/SENT?flash=error")
 		return
@@ -402,6 +401,87 @@ func (s *Server) apiJSON(c *gin.Context, method, path string, payload any, out a
 	return nil
 }
 
+func (s *Server) apiSendMultipart(c *gin.Context, from, to, subject, textBody, mailboxID string) error {
+	makeBody := func() (*bytes.Buffer, string, error) {
+		buf := &bytes.Buffer{}
+		mw := multipart.NewWriter(buf)
+
+		_ = mw.WriteField("fromAddr", from)
+		_ = mw.WriteField("toAddr", to)
+		_ = mw.WriteField("subject", subject)
+		_ = mw.WriteField("textBody", textBody)
+		_ = mw.WriteField("mailboxId", mailboxID)
+
+		form, err := c.MultipartForm()
+		if err == nil && form != nil {
+			for _, fh := range form.File["attachments"] {
+				src, err := fh.Open()
+				if err != nil {
+					_ = mw.Close()
+					return nil, "", err
+				}
+				part, err := mw.CreateFormFile("attachments", fh.Filename)
+				if err != nil {
+					_ = src.Close()
+					_ = mw.Close()
+					return nil, "", err
+				}
+				if _, err := io.Copy(part, src); err != nil {
+					_ = src.Close()
+					_ = mw.Close()
+					return nil, "", err
+				}
+				_ = src.Close()
+			}
+		}
+
+		if err := mw.Close(); err != nil {
+			return nil, "", err
+		}
+		return buf, mw.FormDataContentType(), nil
+	}
+
+	doReq := func(accessToken string) (*http.Response, error) {
+		body, contentType, err := makeBody()
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, strings.TrimRight(s.cfg.APIBaseURL, "/")+"/v1/send", body)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", contentType)
+		if accessToken != "" {
+			req.Header.Set("Authorization", "Bearer "+accessToken)
+		}
+		return s.client.Do(req)
+	}
+
+	access, _ := c.Cookie(cookieAccess)
+	res, err := doReq(access)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode == http.StatusUnauthorized {
+		newAccess, refreshErr := s.refreshTokens(c)
+		if refreshErr == nil {
+			res, err = doReq(newAccess)
+			if err != nil {
+				return err
+			}
+			defer res.Body.Close()
+		}
+	}
+
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		b, _ := io.ReadAll(res.Body)
+		return fmt.Errorf("api status=%d body=%s", res.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
 func (s *Server) refreshTokens(c *gin.Context) (string, error) {
 	refresh, err := c.Cookie(cookieRefresh)
 	if err != nil || refresh == "" {
@@ -430,19 +510,4 @@ func (s *Server) clearAuthCookies(c *gin.Context) {
 	for _, k := range []string{cookieAccess, cookieRefresh, cookieEmail, cookieRole} {
 		c.SetCookie(k, "", -1, "/", "", s.cfg.SecureCookie, true)
 	}
-}
-
-func buildRawMIME(from, to, subject, body string) string {
-	date := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 +0000")
-	return strings.Join([]string{
-		"From: " + from,
-		"To: " + to,
-		"Subject: " + subject,
-		"Date: " + date,
-		"MIME-Version: 1.0",
-		"Content-Type: text/plain; charset=utf-8",
-		"Content-Transfer-Encoding: 8bit",
-		"",
-		body,
-	}, "\r\n")
 }
