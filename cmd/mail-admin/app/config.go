@@ -32,6 +32,34 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	loginIPRateLimitPerMin, err := envx.GetInt("LOGIN_IP_RATE_LIMIT_PER_MIN", 30)
+	if err != nil {
+		return config{}, err
+	}
+	if loginIPRateLimitPerMin < 1 {
+		return config{}, fmt.Errorf("LOGIN_IP_RATE_LIMIT_PER_MIN must be >= 1")
+	}
+	loginFailThreshold, err := envx.GetInt("LOGIN_FAIL_THRESHOLD", 5)
+	if err != nil {
+		return config{}, err
+	}
+	if loginFailThreshold < 1 {
+		return config{}, fmt.Errorf("LOGIN_FAIL_THRESHOLD must be >= 1")
+	}
+	loginLockMinutes, err := envx.GetInt("LOGIN_LOCK_MINUTES", 15)
+	if err != nil {
+		return config{}, err
+	}
+	if loginLockMinutes < 1 {
+		return config{}, fmt.Errorf("LOGIN_LOCK_MINUTES must be >= 1")
+	}
+	sendRateLimitPerMin, err := envx.GetInt("SEND_RATE_LIMIT_PER_MIN", 60)
+	if err != nil {
+		return config{}, err
+	}
+	if sendRateLimitPerMin < 1 {
+		return config{}, fmt.Errorf("SEND_RATE_LIMIT_PER_MIN must be >= 1")
+	}
 	jwtSecret := envx.Get("JWT_SECRET", "")
 	totpChallengeExpiry, err := envx.GetInt("TOTP_CHALLENGE_EXPIRY_MINUTES", 5)
 	if err != nil {
@@ -110,6 +138,10 @@ func loadConfig() (config, error) {
 		SMTPRelayAddr:               envx.Get("SMTP_RELAY_ADDR", "postfix:587"),
 		SMTPUsername:                envx.Get("SMTP_USERNAME", ""),
 		SMTPPassword:                envx.Get("SMTP_PASSWORD", ""),
+		LoginIPRateLimitPerMin:      loginIPRateLimitPerMin,
+		LoginFailThreshold:          loginFailThreshold,
+		LoginLockMinutes:            loginLockMinutes,
+		SendRateLimitPerMin:         sendRateLimitPerMin,
 		LMTPEnabled:                 lmtpEnabled,
 		LMTPAddr:                    envx.Get("LMTP_ADDR", ":2525"),
 		LMTPDomain:                  envx.Get("LMTP_DOMAIN", ""),

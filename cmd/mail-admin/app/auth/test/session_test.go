@@ -71,3 +71,51 @@ func TestIssueRefreshTokenSetsFutureExpiry(t *testing.T) {
 		t.Fatalf("unexpected refresh token result: hash=%q expiry=%v", hash, expiry)
 	}
 }
+
+func TestHandleLoginLocksAccountAfterFailures(t *testing.T) {
+	f := newAuthFixtureWithConfig(t, func(cfg *authsvc.Config) {
+		cfg.LoginFailThreshold = 2
+		cfg.LoginLockMinutes = 10
+	})
+
+	wrongReq1 := newJSONRequest(t, http.MethodPost, "/v1/auth/login", authtypes.LoginRequest{Email: f.cfg.BootstrapAdminEmail, Password: "wrong-password"})
+	wrongRR1 := httptest.NewRecorder()
+	f.service.HandleLogin(wrongRR1, wrongReq1)
+	if wrongRR1.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for first failed login, got %d", wrongRR1.Code)
+	}
+
+	wrongReq2 := newJSONRequest(t, http.MethodPost, "/v1/auth/login", authtypes.LoginRequest{Email: f.cfg.BootstrapAdminEmail, Password: "wrong-password"})
+	wrongRR2 := httptest.NewRecorder()
+	f.service.HandleLogin(wrongRR2, wrongReq2)
+	if wrongRR2.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for second failed login, got %d", wrongRR2.Code)
+	}
+
+	goodReq := newJSONRequest(t, http.MethodPost, "/v1/auth/login", authtypes.LoginRequest{Email: f.cfg.BootstrapAdminEmail, Password: f.cfg.BootstrapAdminPassword})
+	goodRR := httptest.NewRecorder()
+	f.service.HandleLogin(goodRR, goodReq)
+	if goodRR.Code != http.StatusLocked {
+		t.Fatalf("expected 423 for locked account, got %d body=%s", goodRR.Code, goodRR.Body.String())
+	}
+}
+
+func TestHandleLoginRateLimitedByIP(t *testing.T) {
+	f := newAuthFixtureWithConfig(t, func(cfg *authsvc.Config) {
+		cfg.LoginIPRateLimitPerMin = 1
+	})
+
+	firstReq := newJSONRequest(t, http.MethodPost, "/v1/auth/login", authtypes.LoginRequest{Email: f.cfg.BootstrapAdminEmail, Password: "wrong-password"})
+	firstRR := httptest.NewRecorder()
+	f.service.HandleLogin(firstRR, firstReq)
+	if firstRR.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for first request, got %d", firstRR.Code)
+	}
+
+	secondReq := newJSONRequest(t, http.MethodPost, "/v1/auth/login", authtypes.LoginRequest{Email: f.cfg.BootstrapAdminEmail, Password: "wrong-password"})
+	secondRR := httptest.NewRecorder()
+	f.service.HandleLogin(secondRR, secondReq)
+	if secondRR.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 for rate limited request, got %d body=%s", secondRR.Code, secondRR.Body.String())
+	}
+}

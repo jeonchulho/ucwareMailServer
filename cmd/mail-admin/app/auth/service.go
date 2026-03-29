@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/mail"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	authtypes "github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/auth/types"
 	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/infra/httpx"
+	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/infra/ratelimit"
 	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/internal/store"
 	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/security"
 	"github.com/pquerna/otp/totp"
@@ -36,6 +38,9 @@ type Config struct {
 	BootstrapAdminEmail     string
 	BootstrapAdminPassword  string
 	BootstrapAdminRole      string
+	LoginIPRateLimitPerMin  int
+	LoginFailThreshold      int
+	LoginLockMinutes        int
 }
 
 type Dependencies struct {
@@ -59,6 +64,10 @@ type Service struct {
 	setAuthContextFn   func(ctx context.Context, email, role string) context.Context
 	isValidRoleFn      func(role string) bool
 	mu                 sync.RWMutex
+	loginMu            sync.Mutex
+	loginLimiter       *ratelimit.FixedWindow
+	loginFailures      map[string]int
+	loginLockedUntil   map[string]time.Time
 }
 
 type accessClaims struct {
@@ -67,15 +76,29 @@ type accessClaims struct {
 }
 
 func NewService(dep Dependencies) *Service {
+	cfg := dep.Config
+	if cfg.LoginIPRateLimitPerMin < 1 {
+		cfg.LoginIPRateLimitPerMin = 30
+	}
+	if cfg.LoginFailThreshold < 1 {
+		cfg.LoginFailThreshold = 5
+	}
+	if cfg.LoginLockMinutes < 1 {
+		cfg.LoginLockMinutes = 15
+	}
+
 	return &Service{
 		store:              dep.Store,
-		cfg:                dep.Config,
+		cfg:                cfg,
 		googleOAuth2Cfg:    dep.GoogleOAuth2Cfg,
 		microsoftOAuth2Cfg: dep.MicrosoftOAuth2Cfg,
 		writeAuditFn:       dep.WriteAudit,
 		actorFromContextFn: dep.ActorFromContext,
 		setAuthContextFn:   dep.SetAuthContext,
 		isValidRoleFn:      dep.IsValidRole,
+		loginLimiter:       ratelimit.NewFixedWindow(cfg.LoginIPRateLimitPerMin, time.Minute),
+		loginFailures:      make(map[string]int),
+		loginLockedUntil:   make(map[string]time.Time),
 	}
 }
 
@@ -91,6 +114,13 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	now := time.Now().UTC()
+	clientIP := requestClientIP(r)
+	if !s.loginLimiter.Allow(clientIP, now) {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		s.writeAudit(r.Context(), "login", "", "", "failed", "rate limited", r)
+		return
+	}
 	defer r.Body.Close()
 	var req authtypes.LoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -98,9 +128,15 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	if s.isLoginLocked(req.Email, now) {
+		http.Error(w, "account temporarily locked", http.StatusLocked)
+		s.writeAudit(r.Context(), "login", req.Email, req.Email, "failed", "account locked", r)
+		return
+	}
 	adminUser, err := s.store.GetAdminUserByEmail(r.Context(), req.Email)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			s.registerLoginFailure(req.Email, now)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			s.writeAudit(r.Context(), "login", "", req.Email, "failed", "unknown account", r)
 			return
@@ -109,10 +145,12 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(adminUser.PasswordHash), []byte(req.Password)); err != nil {
+		s.registerLoginFailure(req.Email, now)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		s.writeAudit(r.Context(), "login", req.Email, req.Email, "failed", "wrong password", r)
 		return
 	}
+	s.clearLoginFailures(req.Email)
 	if adminUser.TOTPEnabled {
 		challengeID, err := GenerateRefreshToken()
 		if err != nil {
@@ -128,7 +166,6 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, authtypes.TOTPChallengeResponse{Status: "totp_required", ChallengeToken: challengeID})
 		return
 	}
-	now := time.Now().UTC()
 	signed, expiresAt, err := s.issueAccessToken(adminUser, now)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -145,6 +182,72 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	s.writeAudit(r.Context(), "login", req.Email, req.Email, "ok", "login success", r)
 	httpx.WriteJSON(w, http.StatusOK, authtypes.LoginResponse{AccessToken: signed, RefreshToken: rawRT, TokenType: "Bearer", ExpiresAt: expiresAt, Role: adminUser.Role, Email: adminUser.Email})
+}
+
+func (s *Service) isLoginLocked(email string, now time.Time) bool {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if !isValidEmail(email) {
+		return false
+	}
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	lockedUntil, ok := s.loginLockedUntil[email]
+	if !ok {
+		return false
+	}
+	if now.Before(lockedUntil) {
+		return true
+	}
+	delete(s.loginLockedUntil, email)
+	delete(s.loginFailures, email)
+	return false
+}
+
+func (s *Service) registerLoginFailure(email string, now time.Time) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if !isValidEmail(email) {
+		return
+	}
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	if until, ok := s.loginLockedUntil[email]; ok && now.Before(until) {
+		return
+	}
+	s.loginFailures[email]++
+	if s.loginFailures[email] >= s.cfg.LoginFailThreshold {
+		s.loginLockedUntil[email] = now.Add(time.Duration(s.cfg.LoginLockMinutes) * time.Minute)
+		s.loginFailures[email] = 0
+	}
+}
+
+func (s *Service) clearLoginFailures(email string) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return
+	}
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	delete(s.loginFailures, email)
+	delete(s.loginLockedUntil, email)
+}
+
+func requestClientIP(r *http.Request) string {
+	xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
+	if xff != "" {
+		first := strings.TrimSpace(strings.Split(xff, ",")[0])
+		if first != "" {
+			return first
+		}
+	}
+	xri := strings.TrimSpace(r.Header.Get("X-Real-IP"))
+	if xri != "" {
+		return xri
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil && host != "" {
+		return host
+	}
+	return strings.TrimSpace(r.RemoteAddr)
 }
 
 func (s *Service) HandleRefreshToken(w http.ResponseWriter, r *http.Request) {

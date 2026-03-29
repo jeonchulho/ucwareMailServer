@@ -49,6 +49,10 @@ type config struct {
 	SMTPRelayAddr               string
 	SMTPUsername                string
 	SMTPPassword                string
+	LoginIPRateLimitPerMin      int
+	LoginFailThreshold          int
+	LoginLockMinutes            int
+	SendRateLimitPerMin         int
 	LMTPEnabled                 bool
 	LMTPAddr                    string
 	LMTPDomain                  string

@@ -24,6 +24,7 @@ import (
 	archivetypes "github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/handlers/types/archive"
 	userstypes "github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/handlers/types/users"
 	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/infra/httpx"
+	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/infra/ratelimit"
 	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/internal/archive"
 	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/internal/store"
 	"github.com/jeonchulho/ucwareMailServer/cmd/mail-admin/app/internal/syncer"
@@ -45,6 +46,7 @@ type Config struct {
 	SMTPRelayAddr           string
 	SMTPUsername            string
 	SMTPPassword            string
+	SendRateLimitPerMin     int
 }
 
 type SendMessageRequest struct {
@@ -108,16 +110,22 @@ type Service struct {
 	actorFromCtxFn func(ctx context.Context) string
 	roleFromCtxFn  func(ctx context.Context) string
 	mu             sync.Mutex
+	sendLimiter    *ratelimit.FixedWindow
 }
 
 func NewService(dep Dependencies) *Service {
+	cfg := dep.Config
+	if cfg.SendRateLimitPerMin < 1 {
+		cfg.SendRateLimitPerMin = 60
+	}
 	return &Service{
 		store:          dep.Store,
 		archive:        dep.Archive,
-		cfg:            dep.Config,
+		cfg:            cfg,
 		writeAuditFn:   dep.WriteAudit,
 		actorFromCtxFn: dep.ActorFromContext,
 		roleFromCtxFn:  dep.RoleFromContext,
+		sendLimiter:    ratelimit.NewFixedWindow(cfg.SendRateLimitPerMin, time.Minute),
 	}
 }
 
@@ -399,6 +407,17 @@ func (s *Service) HandleMessages(w http.ResponseWriter, r *http.Request) {
 func (s *Service) HandleSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	actor := strings.TrimSpace(s.actorFromContext(r.Context()))
+	if actor == "" {
+		actor = "ip:" + requestClientIP(r)
+	} else {
+		actor = "actor:" + strings.ToLower(actor)
+	}
+	if !s.sendLimiter.Allow(actor, time.Now().UTC()) {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		s.writeAudit(r.Context(), "send_message", s.actorFromContext(r.Context()), "", "failed", "rate limited", r)
 		return
 	}
 	if strings.TrimSpace(s.cfg.SMTPRelayAddr) == "" {
@@ -894,6 +913,25 @@ func smtpHostFromAddr(addr string) string {
 		return strings.TrimSpace(addr[:i])
 	}
 	return strings.TrimSpace(addr)
+}
+
+func requestClientIP(r *http.Request) string {
+	xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
+	if xff != "" {
+		first := strings.TrimSpace(strings.Split(xff, ",")[0])
+		if first != "" {
+			return first
+		}
+	}
+	xri := strings.TrimSpace(r.Header.Get("X-Real-IP"))
+	if xri != "" {
+		return xri
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil && host != "" {
+		return host
+	}
+	return strings.TrimSpace(r.RemoteAddr)
 }
 
 func validateFileCount(files []sendFilePayload) error {

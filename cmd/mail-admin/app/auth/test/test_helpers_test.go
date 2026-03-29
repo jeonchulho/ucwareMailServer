@@ -26,6 +26,11 @@ type authFixture struct {
 
 func newAuthFixture(t *testing.T) *authFixture {
 	t.Helper()
+	return newAuthFixtureWithConfig(t, nil)
+}
+
+func newAuthFixtureWithConfig(t *testing.T, mutate func(*authsvc.Config)) *authFixture {
+	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "data", "mailadmin.db")
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
@@ -48,6 +53,12 @@ func newAuthFixture(t *testing.T) *authFixture {
 		BootstrapAdminEmail:     "admin@example.com",
 		BootstrapAdminPassword:  "ChangeMeAdmin!123",
 		BootstrapAdminRole:      "admin",
+		LoginIPRateLimitPerMin:  30,
+		LoginFailThreshold:      5,
+		LoginLockMinutes:        15,
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 
 	svc := authsvc.NewService(authsvc.Dependencies{
