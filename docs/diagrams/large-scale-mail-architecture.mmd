@@ -1,0 +1,38 @@
+flowchart TB
+    U[사용자 브라우저/메일 클라이언트] --> LB[Nginx 또는 L7/L4 Load Balancer]
+
+    LB --> WF1[web-frontend 1]
+    LB --> WF2[web-frontend 2]
+    LB --> API1[mail-admin 1]
+    LB --> API2[mail-admin 2]
+
+    LB --> MX1[Postfix relay 1]
+    LB --> MX2[Postfix relay 2]
+
+    MX1 --> RM1[Rspamd 1]
+    MX1 --> RM2[Rspamd 2]
+    MX2 --> RM1
+    MX2 --> RM2
+
+    RM1 --> CL1[ClamAV 1]
+    RM1 --> CL2[ClamAV 2]
+    RM2 --> CL1
+    RM2 --> CL2
+
+    RM1 --> IC1[ICAP Gateway 1]
+    RM2 --> IC2[ICAP Gateway 2]
+
+    MX1 --> DVP[Dovecot Proxy/Director]
+    MX2 --> DVP
+
+    DVP --> DV1[Dovecot Storage 1]
+    DVP --> DV2[Dovecot Storage 2]
+
+    API1 --> CFG[중앙 설정/사용자 저장소]
+    API2 --> CFG
+
+    API1 --> ADB[(Archive DB HA)]
+    API2 --> ADB
+
+    DV1 --> MS[(Mail Storage)]
+    DV2 --> MS

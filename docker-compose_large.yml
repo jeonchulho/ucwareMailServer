@@ -1,0 +1,292 @@
+# 대용량 운영 구조 예시용 Docker Compose
+#
+# 목적:
+# - 단일 개발용 compose가 아니라, 다중 인스턴스/계층 분리를 어떻게 가져갈지 보여주는 예시
+# - Nginx 앞단 + web-frontend/mail-admin 다중 인스턴스 + Postfix/Dovecot 2세트 + Rspamd/ClamAV 풀 구성
+#
+# 중요한 제한사항:
+# 1. 이 저장소의 mail-admin은 현재 SQLite + generated 파일 기반이라 완전한 active-active 수평확장에 바로 적합하지 않다.
+# 2. 아래 mail-admin-1, mail-admin-2는 단일 Docker 호스트에서 공유 볼륨으로 동작 예시를 보여줄 뿐이며,
+#    실제 운영에서는 중앙 DB/중앙 설정 저장소/배포 파이프라인으로 바꾸는 것이 우선이다.
+# 3. Dovecot 다중화도 단일 공유 볼륨 예시일 뿐이며, 실서비스는 director/proxy 또는 저장소 샤딩 전략이 필요하다.
+
+services:
+  # 앞단 리버스 프록시 / L7+L4 분산기 예시
+  nginx:
+    image: nginx:1.27
+    container_name: nginx-mail-scale
+    depends_on:
+      - web-frontend-1
+      - web-frontend-2
+      - mail-admin-1
+      - mail-admin-2
+      - postfix-1
+      - postfix-2
+      - dovecot-1
+      - dovecot-2
+    volumes:
+      - ./deploy/nginx/nginx-mail-admin-scale.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8088:80"
+      - "2526:25"
+      - "2588:587"
+      - "2994:993"
+      - "2996:995"
+    networks:
+      - frontend
+      - mail
+
+  # HTTP 웹 프론트엔드 풀
+  web-frontend-1:
+    build:
+      context: .
+      dockerfile: deploy/docker/web-frontend/Dockerfile
+    environment:
+      WEB_ADDR: :8090
+      API_BASE_URL: http://nginx
+      WEB_SECURE_COOKIE: "false"
+    networks:
+      - frontend
+
+  web-frontend-2:
+    build:
+      context: .
+      dockerfile: deploy/docker/web-frontend/Dockerfile
+    environment:
+      WEB_ADDR: :8090
+      API_BASE_URL: http://nginx
+      WEB_SECURE_COOKIE: "false"
+    networks:
+      - frontend
+
+  # 중앙 아카이브 DB
+  archive-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${ARCHIVE_DB_USER:-mail}
+      POSTGRES_PASSWORD: ${ARCHIVE_DB_PASSWORD:-mailpw}
+      POSTGRES_DB: ${ARCHIVE_DB_NAME:-mailarchive}
+    volumes:
+      - archive_db_data:/var/lib/postgresql/data
+    networks:
+      - backend
+
+  # mail-admin 풀 (예시용 active-active)
+  # 주의: 현재 앱 구조상 shared SQLite/generation은 실운영 active-active에 적합하지 않다.
+  mail-admin-1:
+    build:
+      context: .
+      dockerfile: deploy/docker/mail-admin/Dockerfile
+    depends_on:
+      - archive-db
+    user: "0:0"
+    environment:
+      ADDR: :8080
+      JWT_SECRET: ${MAIL_ADMIN_JWT_SECRET:-change-this-jwt-secret}
+      JWT_ISSUER: ${MAIL_ADMIN_JWT_ISSUER:-ucware-mail-admin}
+      JWT_EXPIRY_MINUTES: ${MAIL_ADMIN_JWT_EXPIRY_MINUTES:-60}
+      ARCHIVE_DB_ENABLED: ${ARCHIVE_DB_ENABLED:-true}
+      ARCHIVE_DB_DRIVER: ${ARCHIVE_DB_DRIVER:-postgres}
+      ARCHIVE_DSN: ${ARCHIVE_DSN:-postgres://mail:mailpw@archive-db:5432/mailarchive?sslmode=disable}
+      SMTP_RELAY_ADDR: postfix-1:587
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      LOGIN_IP_RATE_LIMIT_PER_MIN: ${LOGIN_IP_RATE_LIMIT_PER_MIN:-30}
+      LOGIN_FAIL_THRESHOLD: ${LOGIN_FAIL_THRESHOLD:-5}
+      LOGIN_LOCK_MINUTES: ${LOGIN_LOCK_MINUTES:-15}
+      SEND_RATE_LIMIT_PER_MIN: ${SEND_RATE_LIMIT_PER_MIN:-60}
+      LMTP_ENABLED: ${LMTP_ENABLED:-false}
+      LMTP_MAX_MESSAGE_BYTES: ${LMTP_MAX_MESSAGE_BYTES:-209715200}
+      POP3_ENABLED: ${APP_POP3_ENABLED:-false}
+      POP3_ADDR: :110
+      BOOTSTRAP_ADMIN_EMAIL: ${MAIL_ADMIN_EMAIL:-admin@example.com}
+      BOOTSTRAP_ADMIN_PASSWORD: ${MAIL_ADMIN_PASSWORD:-ChangeMeAdmin!123}
+      BOOTSTRAP_ADMIN_ROLE: ${MAIL_ADMIN_ROLE:-admin}
+      DB_PATH: /app/state/mailadmin.db
+      DOVECOT_USERS_FILE: /app/generated/dovecot/users.passwd
+      POSTFIX_MAILBOX_MAPS_FILE: /app/generated/postfix/virtual_mailbox_maps
+      POSTFIX_DOMAINS_FILE: /app/generated/postfix/virtual_mailbox_domains
+      MAIL_ROOT: /var/mail/vhosts
+      MAIL_UID: 5000
+      MAIL_GID: 5000
+    volumes:
+      - mail_admin_state:/app/state
+      - generated_state:/app/generated
+      - vmail:/var/mail/vhosts
+    networks:
+      - frontend
+      - backend
+      - mail
+
+  mail-admin-2:
+    build:
+      context: .
+      dockerfile: deploy/docker/mail-admin/Dockerfile
+    depends_on:
+      - archive-db
+    user: "0:0"
+    environment:
+      ADDR: :8080
+      JWT_SECRET: ${MAIL_ADMIN_JWT_SECRET:-change-this-jwt-secret}
+      JWT_ISSUER: ${MAIL_ADMIN_JWT_ISSUER:-ucware-mail-admin}
+      JWT_EXPIRY_MINUTES: ${MAIL_ADMIN_JWT_EXPIRY_MINUTES:-60}
+      ARCHIVE_DB_ENABLED: ${ARCHIVE_DB_ENABLED:-true}
+      ARCHIVE_DB_DRIVER: ${ARCHIVE_DB_DRIVER:-postgres}
+      ARCHIVE_DSN: ${ARCHIVE_DSN:-postgres://mail:mailpw@archive-db:5432/mailarchive?sslmode=disable}
+      SMTP_RELAY_ADDR: postfix-2:587
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      LOGIN_IP_RATE_LIMIT_PER_MIN: ${LOGIN_IP_RATE_LIMIT_PER_MIN:-30}
+      LOGIN_FAIL_THRESHOLD: ${LOGIN_FAIL_THRESHOLD:-5}
+      LOGIN_LOCK_MINUTES: ${LOGIN_LOCK_MINUTES:-15}
+      SEND_RATE_LIMIT_PER_MIN: ${SEND_RATE_LIMIT_PER_MIN:-60}
+      LMTP_ENABLED: ${LMTP_ENABLED:-false}
+      LMTP_MAX_MESSAGE_BYTES: ${LMTP_MAX_MESSAGE_BYTES:-209715200}
+      POP3_ENABLED: ${APP_POP3_ENABLED:-false}
+      POP3_ADDR: :110
+      BOOTSTRAP_ADMIN_EMAIL: ${MAIL_ADMIN_EMAIL:-admin@example.com}
+      BOOTSTRAP_ADMIN_PASSWORD: ${MAIL_ADMIN_PASSWORD:-ChangeMeAdmin!123}
+      BOOTSTRAP_ADMIN_ROLE: ${MAIL_ADMIN_ROLE:-admin}
+      DB_PATH: /app/state/mailadmin.db
+      DOVECOT_USERS_FILE: /app/generated/dovecot/users.passwd
+      POSTFIX_MAILBOX_MAPS_FILE: /app/generated/postfix/virtual_mailbox_maps
+      POSTFIX_DOMAINS_FILE: /app/generated/postfix/virtual_mailbox_domains
+      MAIL_ROOT: /var/mail/vhosts
+      MAIL_UID: 5000
+      MAIL_GID: 5000
+    volumes:
+      - mail_admin_state:/app/state
+      - generated_state:/app/generated
+      - vmail:/var/mail/vhosts
+    networks:
+      - frontend
+      - backend
+      - mail
+
+  # 보안 체인 풀
+  rspamd-1:
+    image: rspamd/rspamd:latest
+    depends_on:
+      - clamav-1
+      - clamav-2
+    volumes:
+      - ./deploy/docker/rspamd/local.d:/etc/rspamd/local.d:ro
+    networks:
+      - security
+      - mail
+
+  rspamd-2:
+    image: rspamd/rspamd:latest
+    depends_on:
+      - clamav-1
+      - clamav-2
+    volumes:
+      - ./deploy/docker/rspamd/local.d:/etc/rspamd/local.d:ro
+    networks:
+      - security
+      - mail
+
+  clamav-1:
+    image: clamav/clamav:latest
+    networks:
+      - security
+
+  clamav-2:
+    image: clamav/clamav:latest
+    networks:
+      - security
+
+  mock-icap:
+    build:
+      context: .
+      dockerfile: deploy/docker/mock-icap/Dockerfile
+    profiles:
+      - v3mock
+    networks:
+      - security
+
+  # Postfix/Dovecot 1세트
+  postfix-1:
+    build:
+      context: .
+      dockerfile: deploy/docker/postfix/Dockerfile
+    depends_on:
+      - dovecot-1
+      - rspamd-1
+      - mail-admin-1
+    environment:
+      MAIL_DOMAIN: ${MAIL_DOMAIN:-example.com}
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME:-mail1.example.com}
+    volumes:
+      - generated_state:/etc/postfix/generated
+      - ./deploy/docker/postfix/main.cf:/etc/postfix/main.cf:ro
+      - ./deploy/docker/postfix/master.cf:/etc/postfix/master.cf:ro
+      - vmail:/var/mail/vhosts
+      - postfix_spool_1:/var/spool/postfix
+    networks:
+      - mail
+      - security
+
+  dovecot-1:
+    build:
+      context: .
+      dockerfile: deploy/docker/dovecot/Dockerfile
+    depends_on:
+      - mail-admin-1
+    volumes:
+      - generated_state:/etc/dovecot/generated
+      - ./deploy/docker/dovecot/dovecot.conf:/etc/dovecot/dovecot.conf:ro
+      - vmail:/var/mail/vhosts
+      - postfix_spool_1:/var/spool/postfix
+    networks:
+      - mail
+
+  # Postfix/Dovecot 2세트
+  postfix-2:
+    build:
+      context: .
+      dockerfile: deploy/docker/postfix/Dockerfile
+    depends_on:
+      - dovecot-2
+      - rspamd-2
+      - mail-admin-2
+    environment:
+      MAIL_DOMAIN: ${MAIL_DOMAIN:-example.com}
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME:-mail2.example.com}
+    volumes:
+      - generated_state:/etc/postfix/generated
+      - ./deploy/docker/postfix/main.cf:/etc/postfix/main.cf:ro
+      - ./deploy/docker/postfix/master.cf:/etc/postfix/master.cf:ro
+      - vmail:/var/mail/vhosts
+      - postfix_spool_2:/var/spool/postfix
+    networks:
+      - mail
+      - security
+
+  dovecot-2:
+    build:
+      context: .
+      dockerfile: deploy/docker/dovecot/Dockerfile
+    depends_on:
+      - mail-admin-2
+    volumes:
+      - generated_state:/etc/dovecot/generated
+      - ./deploy/docker/dovecot/dovecot.conf:/etc/dovecot/dovecot.conf:ro
+      - vmail:/var/mail/vhosts
+      - postfix_spool_2:/var/spool/postfix
+    networks:
+      - mail
+
+volumes:
+  archive_db_data:
+  mail_admin_state:
+  generated_state:
+  vmail:
+  postfix_spool_1:
+  postfix_spool_2:
+
+networks:
+  frontend:
+  backend:
+  mail:
+  security:
