@@ -51,7 +51,6 @@ type config struct {
 	LMTPDomain                  string
 	POP3Enabled                 bool
 	POP3Addr                    string
-	StaticDir                   string
 }
 
 type server struct {

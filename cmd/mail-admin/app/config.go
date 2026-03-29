@@ -105,7 +105,6 @@ func loadConfig() (config, error) {
 		LMTPDomain:                  envx.Get("LMTP_DOMAIN", ""),
 		POP3Enabled:                 pop3Enabled,
 		POP3Addr:                    envx.Get("POP3_ADDR", ":110"),
-		StaticDir:                   envx.Get("STATIC_DIR", "./front"),
 	}, nil
 }
 

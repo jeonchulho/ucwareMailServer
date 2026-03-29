@@ -25,7 +25,6 @@ services:
     volumes:
       - ./data:/app/data
       - ./generated:/app/generated
-      - ./front:/app/front:ro
       - vmail:/var/mail/vhosts
     ports:
       - "8080:8080"
