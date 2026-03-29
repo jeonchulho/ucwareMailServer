@@ -1,0 +1,37 @@
+[Unit]
+Description=ucware Mail Admin API
+Documentation=https://github.com/jeonchulho/ucwareMailServer
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=mailadmin
+Group=mailadmin
+WorkingDirectory=/opt/mail-admin
+
+# 환경 변수 파일 (chmod 600 권장)
+EnvironmentFile=/etc/mail-admin/env
+
+ExecStart=/opt/mail-admin/mail-admin
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# 표준 출력 → journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mail-admin
+
+# 보안 강화
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/mail-admin/data /opt/mail-admin/generated
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

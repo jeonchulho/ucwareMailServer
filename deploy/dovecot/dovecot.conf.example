@@ -1,0 +1,38 @@
+protocols = imap lmtp
+listen = *
+
+mail_location = maildir:/var/mail/vhosts/%d/%n
+first_valid_uid = 5000
+last_valid_uid = 5000
+
+auth_mechanisms = plain login
+
+passdb {
+  driver = passwd-file
+  args = scheme=BLF-CRYPT username_format=%u /etc/dovecot/users.passwd
+}
+
+userdb {
+  driver = static
+  args = uid=5000 gid=5000 home=/var/mail/vhosts/%d/%n
+}
+
+service auth {
+  unix_listener /var/spool/postfix/private/auth {
+    mode = 0660
+    user = postfix
+    group = postfix
+  }
+}
+
+service lmtp {
+  unix_listener /var/spool/postfix/private/dovecot-lmtp {
+    mode = 0600
+    user = postfix
+    group = postfix
+  }
+}
+
+ssl = required
+ssl_cert = </etc/letsencrypt/live/mail.example.com/fullchain.pem
+ssl_key = </etc/letsencrypt/live/mail.example.com/privkey.pem

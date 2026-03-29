@@ -1,0 +1,116 @@
+services:
+  mail-admin:
+    build:
+      context: .
+      dockerfile: deploy/docker/mail-admin/Dockerfile
+    container_name: mail-admin
+    user: "0:0"
+    environment:
+      ADDR: :8080
+      JWT_SECRET: ${MAIL_ADMIN_JWT_SECRET:-change-this-jwt-secret}
+      JWT_ISSUER: ${MAIL_ADMIN_JWT_ISSUER:-ucware-mail-admin}
+      JWT_EXPIRY_MINUTES: ${MAIL_ADMIN_JWT_EXPIRY_MINUTES:-60}
+      POP3_ENABLED: ${APP_POP3_ENABLED:-false}
+      POP3_ADDR: :110
+      BOOTSTRAP_ADMIN_EMAIL: ${MAIL_ADMIN_EMAIL:-admin@example.com}
+      BOOTSTRAP_ADMIN_PASSWORD: ${MAIL_ADMIN_PASSWORD:-ChangeMeAdmin!123}
+      BOOTSTRAP_ADMIN_ROLE: ${MAIL_ADMIN_ROLE:-admin}
+      DB_PATH: /app/data/mailadmin.db
+      DOVECOT_USERS_FILE: /app/generated/dovecot/users.passwd
+      POSTFIX_MAILBOX_MAPS_FILE: /app/generated/postfix/virtual_mailbox_maps
+      POSTFIX_DOMAINS_FILE: /app/generated/postfix/virtual_mailbox_domains
+      MAIL_ROOT: /var/mail/vhosts
+      MAIL_UID: 5000
+      MAIL_GID: 5000
+    volumes:
+      - ./data:/app/data
+      - ./generated:/app/generated
+      - vmail:/var/mail/vhosts
+    ports:
+      - "8080:8080"
+      - "${APP_POP3_PORT:-2111}:110"
+
+  postfix:
+    build:
+      context: .
+      dockerfile: deploy/docker/postfix/Dockerfile
+    container_name: postfix
+    depends_on:
+      - dovecot
+      - rspamd
+      - mail-admin
+    environment:
+      MAIL_DOMAIN: ${MAIL_DOMAIN:-example.com}
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME:-mail.example.com}
+    volumes:
+      - ./generated/postfix:/etc/postfix/generated
+      - ./deploy/docker/postfix/main.cf:/etc/postfix/main.cf:ro
+      - ./deploy/docker/postfix/master.cf:/etc/postfix/master.cf:ro
+      - vmail:/var/mail/vhosts
+      - postfix_spool:/var/spool/postfix
+    ports:
+      - "2525:25"
+      - "2587:587"
+
+  dovecot:
+    build:
+      context: .
+      dockerfile: deploy/docker/dovecot/Dockerfile
+    container_name: dovecot
+    depends_on:
+      - mail-admin
+    volumes:
+      - ./generated/dovecot:/etc/dovecot/generated
+      - ./deploy/docker/dovecot/dovecot.conf:/etc/dovecot/dovecot.conf:ro
+      - vmail:/var/mail/vhosts
+      - postfix_spool:/var/spool/postfix
+    ports:
+      - "2143:143"
+      - "2993:993"
+      - "2110:110"
+      - "2995:995"
+
+  rspamd:
+    image: rspamd/rspamd:latest
+    container_name: rspamd
+    depends_on:
+      - clamav
+    volumes:
+      - ./deploy/docker/rspamd/local.d:/etc/rspamd/local.d:ro
+    ports:
+      - "11334:11334"
+      - "11332:11332"
+
+  clamav:
+    image: clamav/clamav:latest
+    container_name: clamav
+    ports:
+      - "3310:3310"
+
+  mock-icap:
+    build:
+      context: .
+      dockerfile: deploy/docker/mock-icap/Dockerfile
+    container_name: mock-icap
+    profiles:
+      - v3mock
+    ports:
+      - "1344:1344"
+
+  roundcube:
+    image: roundcube/roundcubemail:latest
+    container_name: roundcube
+    depends_on:
+      - dovecot
+      - postfix
+    environment:
+      ROUNDCUBEMAIL_DEFAULT_HOST: tls://dovecot:993
+      ROUNDCUBEMAIL_SMTP_SERVER: tls://postfix:587
+      ROUNDCUBEMAIL_SMTP_USER: "%u"
+      ROUNDCUBEMAIL_SMTP_PASS: "%p"
+    ports:
+      - "8081:80"
+
+volumes:
+  vmail:
+  postfix_spool:

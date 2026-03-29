@@ -1,0 +1,265 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/mail-admin
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # 1. lint + unit test
+  # ──────────────────────────────────────────────────────────────────────────
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2. build binary + Docker image
+  # ──────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary (linux/amd64)
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w -X main.Version=${GITHUB_SHA::8}" \
+            -o bin/mail-admin ./cmd/mail-admin
+          echo "binary size: $(du -sh bin/mail-admin | cut -f1)"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mail-admin-binary
+          path: bin/mail-admin
+          retention-days: 30
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build (and push on main)
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/docker/mail-admin/Dockerfile
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3. E2E integration test (Docker Compose)
+  # ──────────────────────────────────────────────────────────────────────────
+  e2e:
+    name: E2E Integration Test
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mail-admin-binary
+          path: bin/
+
+      - name: Make binary executable
+        run: chmod +x bin/mail-admin
+
+      - name: Set up Docker Compose
+        run: docker compose version
+
+      - name: Create .env for E2E
+        run: |
+          cat > .env << 'EOF'
+          MAIL_DOMAIN=example.test
+          MAIL_HOSTNAME=mail.example.test
+          MAIL_ADMIN_JWT_SECRET=ci-test-secret-minimum-32-chars!!
+          MAIL_ADMIN_JWT_ISSUER=ucware-mail-admin-ci
+          MAIL_ADMIN_JWT_EXPIRY_MINUTES=60
+          MAIL_ADMIN_EMAIL=admin@example.test
+          MAIL_ADMIN_PASSWORD=CiAdminPass1234
+          MAIL_ADMIN_ROLE=admin
+          EOF
+
+      - name: Run E2E test suite
+        run: chmod +x scripts/e2e-local.sh && ./scripts/e2e-local.sh
+        timeout-minutes: 10
+
+      - name: Upload compose logs on failure
+        if: failure()
+        run: docker compose logs --no-color > compose-failure.log 2>&1 || true
+
+      - name: Upload failure logs artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-failure-logs
+          path: compose-failure.log
+          retention-days: 3
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 4. Security chain test (Rspamd + ClamAV with EICAR)
+  # ──────────────────────────────────────────────────────────────────────────
+  security-eicar:
+    name: Security EICAR Test
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.ref == 'refs/heads/main' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Compose
+        run: docker compose version
+
+      - name: Create .env for security test
+        run: |
+          cat > .env << 'EOF'
+          MAIL_DOMAIN=example.test
+          MAIL_HOSTNAME=mail.example.test
+          MAIL_ADMIN_JWT_SECRET=ci-test-secret-minimum-32-chars!!
+          MAIL_ADMIN_JWT_ISSUER=ucware-mail-admin-ci
+          MAIL_ADMIN_JWT_EXPIRY_MINUTES=60
+          MAIL_ADMIN_EMAIL=admin@example.test
+          MAIL_ADMIN_PASSWORD=CiAdminPass1234
+          MAIL_ADMIN_ROLE=admin
+          EOF
+
+      - name: Run EICAR security chain test
+        run: chmod +x scripts/e2e-security-eicar.sh && ./scripts/e2e-security-eicar.sh
+
+      - name: Upload security logs on failure
+        if: failure()
+        run: |
+          docker compose logs --no-color > compose-security-failure.log 2>&1 || true
+          docker compose ps -a > compose-security-ps.log 2>&1 || true
+
+      - name: Upload security failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-eicar-failure-logs
+          path: |
+            compose-security-failure.log
+            compose-security-ps.log
+          retention-days: 3
+
+      - name: Cleanup compose stack
+        if: always()
+        run: docker compose down -v || true
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 5. Security chain test (V3 external ICAP mock)
+  # ──────────────────────────────────────────────────────────────────────────
+  security-v3-mock:
+    name: Security V3 Mock ICAP Test
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.ref == 'refs/heads/main' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Compose
+        run: docker compose version
+
+      - name: Create .env for V3 mock test
+        run: |
+          cat > .env << 'EOF'
+          MAIL_DOMAIN=example.test
+          MAIL_HOSTNAME=mail.example.test
+          MAIL_ADMIN_JWT_SECRET=ci-test-secret-minimum-32-chars!!
+          MAIL_ADMIN_JWT_ISSUER=ucware-mail-admin-ci
+          MAIL_ADMIN_JWT_EXPIRY_MINUTES=60
+          MAIL_ADMIN_EMAIL=admin@example.test
+          MAIL_ADMIN_PASSWORD=CiAdminPass1234
+          MAIL_ADMIN_ROLE=admin
+          ANTIVIRUS_PROVIDER=v3
+          ANTIVIRUS_V3_ICAP_SERVER=mock-icap:1344
+          ANTIVIRUS_V3_ICAP_SCHEME=respmod
+          EOF
+
+      - name: Run V3 mock ICAP security test
+        run: chmod +x scripts/e2e-security-v3-mock.sh && ./scripts/e2e-security-v3-mock.sh
+
+      - name: Upload V3 mock logs on failure
+        if: failure()
+        run: |
+          docker compose --profile v3mock logs --no-color > compose-v3mock-failure.log 2>&1 || true
+          docker compose --profile v3mock ps -a > compose-v3mock-ps.log 2>&1 || true
+
+      - name: Upload V3 mock failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-v3-mock-failure-logs
+          path: |
+            compose-v3mock-failure.log
+            compose-v3mock-ps.log
+          retention-days: 3
+
+      - name: Cleanup V3 mock compose stack
+        if: always()
+        run: docker compose --profile v3mock down -v || true

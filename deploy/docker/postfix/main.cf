@@ -1,0 +1,37 @@
+compatibility_level = 2
+
+myhostname = ${MAIL_HOSTNAME}
+mydomain = ${MAIL_DOMAIN}
+myorigin = $mydomain
+inet_interfaces = all
+inet_protocols = ipv4
+
+smtpd_banner = $myhostname ESMTP
+append_dot_mydomain = no
+biff = no
+readme_directory = no
+
+mynetworks = 127.0.0.0/8 [::1]/128
+smtpd_helo_required = yes
+smtpd_recipient_restrictions =
+    permit_mynetworks,
+    permit_sasl_authenticated,
+    reject_unauth_destination
+
+virtual_mailbox_domains = hash:/etc/postfix/generated/virtual_mailbox_domains
+virtual_mailbox_maps = hash:/etc/postfix/generated/virtual_mailbox_maps
+virtual_transport = lmtp:unix:private/dovecot-lmtp
+
+smtpd_sasl_auth_enable = yes
+smtpd_sasl_type = dovecot
+smtpd_sasl_path = private/auth
+smtpd_sasl_security_options = noanonymous
+
+# Rspamd milter (Rspamd에서 스팸/바이러스 정책 평가)
+milter_protocol = 6
+milter_default_action = accept
+smtpd_milters = inet:rspamd:11332
+non_smtpd_milters = inet:rspamd:11332
+
+# Local dev only. In production use real TLS certs and stronger policy.
+smtpd_tls_security_level = may
